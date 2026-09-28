@@ -1,0 +1,9 @@
+{
+  "name": "clickup-clone",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "dev:api": "pnpm --filter api start:dev"
+  }
+}
