@@ -10,6 +10,7 @@ import { TasksModule } from './tasks/tasks.module.js';
 import { CustomFieldsModule } from './custom-fields/custom-fields.module.js';
 import { StatusesModule } from './statuses/statuses.module.js';
 import { AiModule } from './ai/ai.module.js';
+import { NotificationsModule } from './notifications/notifications.module.js';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { AiModule } from './ai/ai.module.js';
     CustomFieldsModule,
     StatusesModule,
     AiModule,
+    NotificationsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

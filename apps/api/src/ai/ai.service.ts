@@ -3,6 +3,9 @@ import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { AiProviderService, ChatMessage, LlmTool } from './ai-provider.service.js';
 import { AiTaskCard, AiToolsService, GetTasksFilters } from './ai-tools.service.js';
+import { EmailService } from '../email/email.service.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
+import { SmartNotificationsService } from '../notifications/smart-notifications.service.js';
 import { AiContextDto } from './dto/ai-context.dto.js';
 import { CreateAiChatDto } from './dto/create-chat.dto.js';
 import { SendAiMessageDto } from './dto/send-message.dto.js';
@@ -154,6 +157,9 @@ export class AiService {
     private prisma: PrismaService,
     private tools: AiToolsService,
     private provider: AiProviderService,
+    private smart: SmartNotificationsService,
+    private notifications: NotificationsService,
+    private emails: EmailService,
   ) {}
 
   async listChats(userId: string, workspaceId: string) {
@@ -241,82 +247,172 @@ export class AiService {
     return this.provider.status();
   }
 
+  async dailyBrief(userId: string, workspaceId: string, generate: boolean) {
+    const [user, prefs, facts] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: userId }, select: { name: true } }),
+      this.notifications.getPreferences(userId),
+      this.smart.build(userId, workspaceId),
+    ]);
+    if (!user) throw new ForbiddenException('User not found');
+    const briefDate = this.briefDate();
+    const cached = await this.prisma.dailyBrief.findUnique({
+      where: { userId_workspaceId_briefDate: { userId, workspaceId, briefDate } },
+    });
+    let summary = cached?.content ?? null;
+    let summaryUnavailable = false;
+    let generatedAt = cached?.generatedAt ?? null;
+    if (generate) {
+      const written = await this.writeDailySummary(user.name, facts);
+      if (written) {
+        const saved = await this.prisma.dailyBrief.upsert({
+          where: { userId_workspaceId_briefDate: { userId, workspaceId, briefDate } },
+          create: { userId, workspaceId, briefDate, content: written },
+          update: { content: written, generatedAt: new Date() },
+        });
+        summary = saved.content;
+        generatedAt = saved.generatedAt;
+      } else if (!summary) {
+        summaryUnavailable = true;
+      }
+    }
+    await this.emails.maybeSendDailySummary(userId, workspaceId, facts).catch(() => undefined);
+    return {
+      ...facts,
+      userName: user.name,
+      aiEnabled: prefs.dailyAiBrief,
+      aiSummary: summary,
+      summaryUnavailable,
+      cached: Boolean(cached) && !generate,
+      generatedAt,
+    };
+  }
+
+  private briefDate(now = new Date()) {
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${now.getFullYear()}-${month}-${day}`;
+  }
+
+  private async writeDailySummary(userName: string, facts: Awaited<ReturnType<SmartNotificationsService['build']>>) {
+    const allowed = new Set(
+      [...facts.overdue, ...facts.dueToday, ...facts.dueTomorrow, ...facts.mentions, ...facts.completed, ...facts.inProgress].map((task) =>
+        task.title.toLowerCase(),
+      ),
+    );
+    const text = await this.provider.complete([
+      {
+        role: 'system',
+        content:
+          'You are an AI workspace assistant. Summarize only the workspace facts supplied by the application. Do not invent tasks, users, dates, priorities, statuses, comments, or activity. Use the supplied counts exactly. If a list is empty, do not mention items for it. Write at most 3 short sentences.',
+      },
+      {
+        role: 'user',
+        content: `Write today's brief for ${userName} using only this JSON:\n${JSON.stringify(this.smart.llmContext(userName, facts))}`,
+      },
+    ]);
+    if (!text) return null;
+    const quoted = [...text.matchAll(/"([^"]{2,80})"/g)].map((match) => match[1].toLowerCase());
+    if (quoted.some((title) => !allowed.has(title) && title !== userName.toLowerCase())) return null;
+    return text.slice(0, 700);
+  }
+
+  private async assignmentAnswer(userId: string, workspaceId: string, task: AiTaskCard) {
+    const note = await this.prisma.notification.findFirst({
+      where: { userId, workspaceId, taskId: task.id, type: { in: ['TASK_ASSIGNED', 'TASK_REASSIGNED'] } },
+      orderBy: { createdAt: 'desc' },
+      include: { actor: { select: { name: true } } },
+    });
+    if (note?.actor?.name) return `${note.actor.name} assigned ${task.title} to you.`;
+    const activity = await this.tools.getTaskActivity(userId, workspaceId, task.id);
+    if (activity.note) {
+      return `${task.title} is assigned to ${task.assigneeName || 'Unassigned'}. ${activity.note}`;
+    }
+    return `${task.title} is assigned to ${task.assigneeName || 'Unassigned'}.`;
+  }
+
   async sendMessage(userId: string, workspaceId: string, chatId: string, dto: SendAiMessageDto) {
-    const chat = await this.getChat(userId, workspaceId, chatId);
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    const text = dto.content.trim();
+    const greeting = this.isGreeting(text);
+    const listQuestion = this.coverageCalls(text, '', dto.context).length > 0;
+    const aboutPrevious = /\bwhich one\b|\bwho assigned\b|\bwho mentioned\b/i.test(text);
+    const followUp = !greeting && !dto.taskIds?.length && (aboutPrevious || (!listQuestion && this.refersToFocused(text)));
+
+    const [chat, user, lookedUp] = await Promise.all([
+      this.prisma.aiChat.findFirst({
+        where: { id: chatId, workspaceId, userId },
+        select: {
+          id: true,
+          title: true,
+          model: true,
+          contextJson: true,
+          messages: {
+            where: { role: 'assistant' },
+            orderBy: { createdAt: 'desc' },
+            take: 1,
+            select: { responseJson: true },
+          },
+        },
+      }),
+      this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, name: true } }),
+      greeting || followUp ? Promise.resolve(null) : this.tools.quickLookup(userId, workspaceId, text),
+    ]);
+    if (!chat) throw new NotFoundException('Chat not found');
     if (!user) throw new ForbiddenException('User not found');
 
-    const resolved = await this.resolveComposerContext(userId, workspaceId, dto);
-    const context = resolved.context || dto.context || (chat.contextJson as AiContextDto | null) || undefined;
-    const history = chat.messages.filter((m) => m.role === 'user' || m.role === 'assistant').slice(-40);
-    const lastAssistant = [...chat.messages].reverse().find((m) => m.role === 'assistant');
-    const lastTasks = resolved.tasks.length ? resolved.tasks : this.extractTasks(lastAssistant?.responseJson);
-    const message = this.composeUserMessage(dto.content.trim(), dto);
-
-    const userMessage = await this.prisma.aiMessage.create({
-      data: {
-        chatId,
-        role: 'user',
-        content: dto.content.trim(),
-        contextJson: {
-          ...(context as object | undefined),
-          taskIds: dto.taskIds,
-          listIds: dto.listIds,
-          userIds: dto.userIds,
-          links: dto.links,
-          attachments: dto.attachments?.map((a) => ({ name: a.name, type: a.type, size: a.size })),
-        },
-      },
-    });
-
-    let structured: AiStructuredResponse;
-    let toolCalls: ToolRun[] = [];
-    try {
-      const answered = await this.answer({
-        userId,
-        userName: user.name,
-        workspaceId,
-        message,
-        context,
-        lastTasks,
-        history: history.map((m: { role: string; content: string }) => ({ role: m.role, content: m.content })),
-        model: dto.model || chat.model || undefined,
-      });
-      structured = answered.structured;
-      toolCalls = answered.toolCalls;
-    } catch {
-      structured = {
-        type: 'answer',
-        content: 'I hit a temporary error reading workspace records. Please send that question again.',
-        tasks: [],
-        entities: [],
-        actions: [],
-        source: 'workspace',
-        usedLlm: false,
-      };
+    const context = dto.context || (chat.contextJson as AiContextDto | null) || undefined;
+    const lastTasks = this.extractTasks(chat.messages[0]?.responseJson);
+    const tasks = lookedUp ?? lastTasks;
+    let answerTasks = tasks;
+    let answerText = this.fallbackAnswer({ message: text, userName: user.name }, tasks, []);
+    if (!greeting && followUp && tasks[0] && /\bwho assigned\b|\bassigned it\b/i.test(text)) {
+      answerText = await this.assignmentAnswer(userId, workspaceId, tasks[0]);
+      answerTasks = [tasks[0]];
     }
-
-    const assistantMessage = await this.prisma.aiMessage.create({
-      data: {
-        chatId,
-        role: 'assistant',
-        content: structured.content,
-        contextJson: (context as object | undefined) ?? undefined,
-        toolCalls: toolCalls as object,
-        responseJson: structured as object,
-      },
-    });
+    const structured: AiStructuredResponse = greeting
+      ? {
+          type: 'answer',
+          content: 'Hi! 👋 How can I help you with your workspace?',
+          tasks: [],
+          entities: [],
+          actions: [],
+          source: 'workspace',
+          usedLlm: false,
+        }
+      : this.toResult(answerText, answerTasks, [], false).structured;
 
     const shouldRename = chat.title === 'New chat' || chat.title.startsWith('New chat');
-    const title = shouldRename ? this.titleFrom(dto.content) : chat.title;
-    const updated = await this.prisma.aiChat.update({
-      where: { id: chatId },
-      data: {
-        title,
-        contextJson: (context as object | undefined) ?? undefined,
-        model: dto.model || chat.model || this.provider.model,
-      },
-    });
+    const title = shouldRename ? this.titleFrom(text) : chat.title;
+    const contextJson = {
+      ...(context as object | undefined),
+      taskIds: dto.taskIds,
+      listIds: dto.listIds,
+      userIds: dto.userIds,
+      links: dto.links,
+    };
+
+    const [userMessage, assistantMessage, updated] = await Promise.all([
+      this.prisma.aiMessage.create({
+        data: { chatId, role: 'user', content: text, contextJson },
+      }),
+      this.prisma.aiMessage.create({
+        data: {
+          chatId,
+          role: 'assistant',
+          content: structured.content,
+          contextJson: (context as object | undefined) ?? undefined,
+          toolCalls: [],
+          responseJson: structured as object,
+        },
+      }),
+      this.prisma.aiChat.update({
+        where: { id: chatId },
+        data: {
+          title,
+          contextJson: (context as object | undefined) ?? undefined,
+          model: dto.model || chat.model || this.provider.model,
+        },
+      }),
+    ]);
 
     return {
       chat: { id: updated.id, title: updated.title, updatedAt: updated.updatedAt },
@@ -361,17 +457,20 @@ export class AiService {
     let content: string | null = null;
     let usedLlm = false;
 
+    const coverage = this.coverageCalls(input.message, input.userName, input.context);
+    if (coverage.length) {
+      for (const call of coverage) {
+        const result = await this.executeTool(input.userId, input.workspaceId, input.context, input.userId, call);
+        toolCalls.push({ name: call.name, args: call.args, result });
+      }
+      const tasks = this.collectTasks(toolCalls, focused, input.message);
+      return this.toResult(this.fallbackAnswer(input, tasks, toolCalls), tasks, toolCalls, false);
+    }
+
     if (this.provider.llmEnabled) {
       const result = await this.runLlmTools(input, focused, toolCalls);
       content = result.content;
       usedLlm = result.usedLlm;
-    }
-
-    const coverage = this.coverageCalls(input.message, input.userName, input.context);
-    for (const call of coverage) {
-      if (this.alreadyCalled(toolCalls, call.name, call.args)) continue;
-      const result = await this.executeTool(input.userId, input.workspaceId, input.context, input.userId, call);
-      toolCalls.push({ name: call.name, args: call.args, result });
     }
 
     let tasks = this.collectTasks(toolCalls, focused, input.message);
@@ -408,6 +507,15 @@ export class AiService {
 
     if (!content) content = this.fallbackAnswer(input, tasks, toolCalls);
 
+    return this.toResult(content, tasks, toolCalls, usedLlm);
+  }
+
+  private toResult(
+    content: string,
+    tasks: AiTaskCard[],
+    toolCalls: ToolRun[],
+    usedLlm: boolean,
+  ): { structured: AiStructuredResponse; toolCalls: ToolRun[] } {
     const unique = this.mergeTasks([], tasks);
     const actions: AiStructuredResponse['actions'] = [];
     if (unique.length === 1) actions.push({ type: 'open_task', label: 'Open Task', taskId: unique[0].id });
@@ -705,6 +813,12 @@ export class AiService {
       }
       return 'I could not find matching workspace records for that. Try naming a task, person, or list.';
     }
+    if (/high priority/.test(q)) {
+      const high = tasks.filter((task) => /high|urgent/i.test(task.priority || ''));
+      if (!high.length) return 'None of these tasks are high priority.';
+      if (high.length === 1) return `${high[0].title} is high priority.`;
+      return `These tasks are high priority:\n${high.map((task) => `• ${task.title}`).join('\n')}`;
+    }
     if (tasks.length === 1) {
       const t = tasks[0];
       if (/creat/i.test(q)) return `${t.title} was created by ${t.createdByName || 'an unknown user'}.`;
@@ -718,7 +832,19 @@ export class AiService {
       if (/space/i.test(q)) return `${t.title} is in the ${t.spaceName} space.`;
       return `${t.title} is ${t.status}, assigned to ${t.assigneeName || 'Unassigned'}, created by ${t.createdByName || 'unknown'}.`;
     }
-    return `I found ${tasks.length} matching tasks.`;
+    const preview = tasks
+      .slice(0, 8)
+      .map((t) => `• ${t.title} — ${t.status}${t.assigneeName ? `, assigned to ${t.assigneeName}` : ''}`)
+      .join('\n');
+    const more = tasks.length > 8 ? `\n…and ${tasks.length - 8} more.` : '';
+    const label = /\boverdue\b/.test(q)
+      ? 'overdue'
+      : /\bdue today\b/.test(q)
+        ? 'due today'
+        : /\bmention/.test(q)
+          ? 'where you were mentioned'
+          : 'matching';
+    return `Here are ${tasks.length} ${label} tasks:\n${preview}${more}`;
   }
 
   private async executeTool(

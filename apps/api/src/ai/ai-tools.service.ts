@@ -235,6 +235,147 @@ export class AiToolsService {
     };
   }
 
+  async quickLookup(userId: string, workspaceId: string, message: string): Promise<AiTaskCard[]> {
+    const q = message
+      .toLowerCase()
+      .replace(/\ba+re\b/g, 'are')
+      .replace(/\btaks\b/g, 'tasks')
+      .replace(/\bwhats\b/g, 'what is');
+    const mine = /\b(my|mine)\b/.test(q) && /\b(task|tasks|work|todo|assigned|progress|attention)\b/.test(q);
+    const inProgress = /\bin progress\b|\bdoing\b|\bworking on\b/.test(q);
+    const overdue = /\boverdue\b|\bpast due\b/.test(q);
+    const dueToday = /\bdue today\b/.test(q);
+    const dueTomorrow = /\bdue tomorrow\b/.test(q);
+    const attention = /\battention\b|\bfocus\b/.test(q);
+    const progress = /\bprogress\b/.test(q);
+    const mentions = /\bmention/.test(q);
+    const high = /\bhigh priority\b|\burgent\b/.test(q);
+    const where: Prisma.TaskWhereInput = { list: { space: { workspaceId } } };
+    const and: Prisma.TaskWhereInput[] = [];
+
+    if (mine) {
+      and.push({
+        OR: [
+          { assigneeId: userId },
+          { assignees: { some: { userId } } },
+          { createdById: userId },
+        ],
+      });
+    }
+    if (high) {
+      and.push({
+        OR: [
+          { priority: { equals: 'High', mode: 'insensitive' } },
+          { priority: { equals: 'Urgent', mode: 'insensitive' } },
+        ],
+      });
+    }
+    if (overdue) and.push({ dueDate: { lt: this.startOfDay(new Date()) } });
+    if (dueToday || dueTomorrow) {
+      const start = this.startOfDay(new Date());
+      if (dueTomorrow) start.setDate(start.getDate() + 1);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 1);
+      and.push({ dueDate: { gte: start, lt: end } });
+    }
+    if (mentions) {
+      const notes = await this.prisma.notification.findMany({
+        where: { userId, workspaceId, type: 'TASK_MENTION' },
+        select: { taskId: true },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      });
+      const ids = notes.map((note) => note.taskId).filter((id): id is string => Boolean(id));
+      if (!ids.length) return [];
+      and.push({ id: { in: ids } });
+    }
+
+    const generic = new Set([
+      'who', 'what', 'when', 'where', 'why', 'how', 'are', 'the', 'my', 'mine', 'task', 'tasks', 'work',
+      'show', 'tell', 'please', 'about', 'all', 'any', 'progress', 'overdue', 'due', 'today', 'week',
+      'high', 'priority', 'urgent', 'assigned', 'todo', 'list', 'give', 'for', 'and', 'with', 'from',
+      'current', 'currently', 'doing', 'working', 'this', 'that', 'you', 'your', 'have', 'has',
+    ]);
+    const words = q
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2 && !generic.has(w));
+    const guided = overdue || dueToday || dueTomorrow || attention || progress || mentions || inProgress || high;
+    if (words.length && !mine && !guided) {
+      and.push({
+        OR: words.slice(0, 3).flatMap((w) => [
+          { title: { contains: w, mode: 'insensitive' as const } },
+          { list: { name: { contains: w, mode: 'insensitive' as const } } },
+          { list: { space: { name: { contains: w, mode: 'insensitive' as const } } } },
+        ]),
+      });
+    }
+    if (and.length) where.AND = and;
+
+    const rows = await this.prisma.task.findMany({
+      where,
+      select: {
+        id: true,
+        title: true,
+        description: true,
+        statusId: true,
+        priority: true,
+        dueDate: true,
+        startDate: true,
+        assigneeId: true,
+        assigneeName: true,
+        ownerName: true,
+        createdById: true,
+        createdAt: true,
+        listId: true,
+        url: true,
+        workCategory: true,
+        list: {
+          select: {
+            id: true,
+            name: true,
+            space: {
+              select: {
+                id: true,
+                name: true,
+                statuses: { select: { id: true, name: true, type: true, color: true } },
+              },
+            },
+          },
+        },
+        assignee: { select: { id: true, name: true } },
+        createdBy: { select: { id: true, name: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 25,
+    });
+
+    let cards = rows.map((t) => this.toCard(t as TaskRow));
+    if (inProgress || progress) cards = cards.filter((t) => t.statusType === 'in_progress' || /progress|doing/i.test(t.status));
+    if ((mine || inProgress || attention || dueToday || dueTomorrow) && !mentions) {
+      cards = cards.filter((t) => t.statusType !== 'done');
+    }
+    if (overdue) cards = cards.filter((t) => t.isOverdue);
+    if (attention) {
+      const start = this.startOfDay(new Date());
+      const end = new Date(start);
+      end.setDate(end.getDate() + 1);
+      const score = (task: AiTaskCard) => {
+        const due = task.dueDate ? new Date(task.dueDate) : null;
+        const dueTodayCard = Boolean(due && due >= start && due < end && !task.isOverdue);
+        const highCard = /high|urgent/i.test(task.priority || '');
+        if (task.isOverdue && highCard) return 0;
+        if (task.isOverdue) return 1;
+        if (dueTodayCard && highCard) return 2;
+        if (dueTodayCard) return 3;
+        if (highCard) return 4;
+        return 5;
+      };
+      cards.sort((a, b) => score(a) - score(b));
+    }
+    return cards;
+  }
+
   async getTasks(
     userId: string,
     workspaceId: string,

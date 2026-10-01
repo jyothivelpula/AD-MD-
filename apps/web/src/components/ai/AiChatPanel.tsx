@@ -5,6 +5,7 @@ import { apiFetch } from '@/lib/api';
 import { AiContext, AiMessage, AiStructured, AiTaskCard, SUGGESTION_CARDS } from './types';
 import AiComposer, { ComposerChip } from './AiComposer';
 import AiIcon from './AiIcon';
+import DailyBrief from './DailyBrief';
 
 type Props = {
   workspaceId: string;
@@ -13,9 +14,11 @@ type Props = {
   accent: string;
   chatId: string | null;
   context: AiContext;
+  openBriefToken?: number;
   onEnsureChat: () => Promise<string>;
   onChatUpdated: () => void;
   onOpenTask: (task: AiTaskCard) => void;
+  onViewTasks?: (tasks: AiTaskCard[]) => void;
   onOpenSearch?: () => void;
 };
 
@@ -103,12 +106,15 @@ function TaskCard({ task, accent, onOpen }: { task: AiTaskCard; accent: string; 
 export default function AiChatPanel({
   workspaceId,
   workspaceName,
+  userName,
   accent,
   chatId,
   context,
+  openBriefToken = 0,
   onEnsureChat,
   onChatUpdated,
   onOpenTask,
+  onViewTasks,
   onOpenSearch,
 }: Props) {
   const [messages, setMessages] = useState<AiMessage[]>([]);
@@ -116,12 +122,17 @@ export default function AiChatPanel({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const [mode, setMode] = useState<'ask' | 'agents'>('ask');
+  const [briefView, setBriefView] = useState(false);
   const [chips, setChips] = useState<ComposerChip[]>([]);
   const sendingRef = useRef(false);
   const scroller = useRef<HTMLDivElement>(null);
 
   const visibleMessages = messages.filter((m) => m.role === 'user' || m.role === 'assistant');
   const showHome = visibleMessages.length === 0 && !sending;
+
+  useEffect(() => {
+    if (openBriefToken) setBriefView(true);
+  }, [openBriefToken]);
 
   useEffect(() => {
     let cancelled = false;
@@ -170,6 +181,7 @@ export default function AiChatPanel({
             ? { type: 'person' as const, id: primary.id, name: primary.name }
             : context;
 
+    setBriefView(false);
     setSending(true);
     sendingRef.current = true;
     setError('');
@@ -309,7 +321,18 @@ export default function AiChatPanel({
         </button>
       </header>
 
-      {showHome ? (
+      {briefView ? (
+        <div className="relative z-10 flex-1 overflow-y-auto">
+          <DailyBrief
+            workspaceId={workspaceId}
+            userName={userName}
+            mode="full"
+            onOpenTask={onOpenTask}
+            onAsk={send}
+            onClose={() => setBriefView(false)}
+          />
+        </div>
+      ) : showHome ? (
         <div className="relative z-10 flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-[720px] px-6 pt-[72px] pb-16">
             <div className="flex items-center justify-center gap-3 mb-11">
@@ -342,6 +365,16 @@ export default function AiChatPanel({
                   </button>
                 ))}
               </div>
+            )}
+            {mode === 'ask' && (
+              <DailyBrief
+                workspaceId={workspaceId}
+                userName={userName}
+                mode="compact"
+                onOpenTask={onOpenTask}
+                onAsk={send}
+                onClose={() => setBriefView(true)}
+              />
             )}
             {error && <p className="text-sm text-red-600 mt-4 text-center">{error}</p>}
           </div>
@@ -384,7 +417,9 @@ export default function AiChatPanel({
                               if (a.type === 'open_task' && a.taskId) {
                                 const t = tasks.find((x) => x.id === a.taskId);
                                 if (t) onOpenTask(t);
+                                return;
                               }
+                              if (a.type === 'view_tasks' && tasks.length) onViewTasks?.(tasks);
                             }}
                           >
                             {a.label}

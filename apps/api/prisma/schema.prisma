@@ -13,9 +13,11 @@ model Workspace {
   plan      String   @default("free")
   ownerId   String
   createdAt DateTime @default(now())
-  members   WorkspaceMember[]
-  spaces    Space[]
-  aiChats   AiChat[]
+  members       WorkspaceMember[]
+  spaces        Space[]
+  aiChats       AiChat[]
+  notifications Notification[]
+  dailyBriefs   DailyBrief[]
 }
 
 model User {
@@ -23,6 +25,8 @@ model User {
   email        String   @unique
   passwordHash String
   name         String
+  emailVerified   Boolean   @default(false)
+  emailVerifiedAt DateTime?
   createdAt    DateTime @default(now())
 
   memberships        WorkspaceMember[]
@@ -30,6 +34,11 @@ model User {
   createdTasks       Task[]            @relation("TaskCreatedBy")
   taskAssigneeLinks  TaskAssignee[]
   aiChats            AiChat[]
+  notifications           Notification[]
+  actedNotifications      Notification[]         @relation("NotificationActor")
+  notificationPreference  NotificationPreference?
+  dailyBriefs             DailyBrief[]
+  sentEmails              TaskEmail[]
 }
 
 model WorkspaceMember {
@@ -106,8 +115,11 @@ model Task {
   timeEntries  TimeEntry[]
   nextActions  NextActionEntry[]
 
-  subtasks   Task[]  @relation("TaskSubtasks")
-  parentTask Task?   @relation("TaskSubtasks", fields: [parentTaskId], references: [id], onDelete: Cascade)
+  subtasks      Task[]         @relation("TaskSubtasks")
+  parentTask    Task?          @relation("TaskSubtasks", fields: [parentTaskId], references: [id], onDelete: Cascade)
+  notifications Notification[]
+
+  emails TaskEmail[]
 }
 
 model NextActionEntry {
@@ -238,4 +250,96 @@ model AiMessage {
   createdAt    DateTime @default(now())
 
   @@index([chatId, createdAt])
+}
+
+model Notification {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  taskId      String?
+  task        Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  type        String
+  title       String
+  message     String
+  isRead      Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  readAt      DateTime?
+  actorId     String?
+  actor       User?     @relation("NotificationActor", fields: [actorId], references: [id], onDelete: SetNull)
+  eventKey    String?   @unique
+
+  @@index([userId, isRead, createdAt])
+  @@index([userId, workspaceId, createdAt])
+  @@index([userId, workspaceId, type, createdAt])
+}
+
+model NotificationPreference {
+  id                   String   @id @default(uuid())
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  taskAssigned         Boolean  @default(true)
+  taskReassigned       Boolean  @default(true)
+  taskStatusChanged    Boolean  @default(true)
+  taskPriorityChanged  Boolean  @default(true)
+  taskCompleted        Boolean  @default(true)
+  taskReopened         Boolean  @default(true)
+  taskDueToday         Boolean  @default(true)
+  taskDueTomorrow      Boolean  @default(true)
+  taskOverdue          Boolean  @default(true)
+  taskComment          Boolean  @default(true)
+  taskMention          Boolean  @default(true)
+  workspaceActivity    Boolean  @default(true)
+  dailyAiBrief         Boolean  @default(false)
+  dailyDigest          Boolean  @default(false)
+  emailTaskAssigned    Boolean  @default(true)
+  emailTaskReassigned  Boolean  @default(true)
+  emailTaskDueToday    Boolean  @default(true)
+  emailTaskDueTomorrow Boolean  @default(true)
+  emailTaskOverdue     Boolean  @default(true)
+  emailTaskComment     Boolean  @default(true)
+  emailTaskMention     Boolean  @default(true)
+  emailTaskStatusChanged Boolean @default(true)
+  emailTaskPriorityChanged Boolean @default(true)
+  emailDailySummary    Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model DailyBrief {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  briefDate   String
+  content     String
+  generatedAt DateTime  @default(now())
+
+  @@unique([userId, workspaceId, briefDate])
+  @@index([userId, workspaceId, briefDate])
+}
+
+model TaskEmail {
+  id              String    @id @default(uuid())
+  taskId          String?
+  task            Task?     @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  workspaceId     String
+  senderId        String
+  sender          User      @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  recipientEmail  String
+  cc              String?
+  subject         String
+  body            String
+  status          String    @default("pending")
+  messageId       String?
+  error           String?
+  kind            String    @default("manual")
+  notificationType String?
+  sentAt          DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([taskId, createdAt])
+  @@index([senderId, kind, createdAt])
 }

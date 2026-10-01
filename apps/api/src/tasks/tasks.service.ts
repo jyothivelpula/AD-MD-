@@ -1,7 +1,9 @@
-import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { join } from 'path';
 import { unlinkSync } from 'fs';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
+import { EmailService } from '../email/email.service.js';
 import { CreateTaskDto } from './dto/create-task.dto.js';
 import { UpdateTaskDto } from './dto/update-task.dto.js';
 import { AddNextActionDto } from './dto/add-next-action.dto.js';
@@ -18,7 +20,11 @@ function parseDate(value?: string): Date | null | undefined {
 
 @Injectable()
 export class TasksService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private notifications: NotificationsService,
+    private emails: EmailService,
+  ) {}
 
   private async assertListAccess(userId: string, listId: string) {
     const list = await this.prisma.list.findUnique({
@@ -144,16 +150,16 @@ export class TasksService {
 
   async listPeople(actorId: string, spaceId: string) {
     await this.assertSpaceMember(actorId, spaceId);
-    const people: { key: string; userId: string | null; name: string }[] = [];
+    const people: { key: string; userId: string | null; name: string; email: string | null }[] = [];
     const seen = new Set<string>();
 
-    const addPerson = (name: string, userId: string | null) => {
+    const addPerson = (name: string, userId: string | null, email: string | null = null) => {
       const label = name.trim();
       if (!label) return;
       const k = label.toLowerCase();
       if (seen.has(k)) return;
       seen.add(k);
-      people.push({ key: userId || `name:${label}`, userId, name: label });
+      people.push({ key: userId || `name:${label}`, userId, name: label, email });
     };
 
     const space = await this.prisma.space.findUnique({
@@ -165,7 +171,7 @@ export class TasksService {
     const memberUsers = await this.prisma.user.findMany({
       where: { id: { in: space.workspace.members.map((m: { userId: string }) => m.userId) } },
     });
-    for (const user of memberUsers) addPerson(user.name, user.id);
+    for (const user of memberUsers) addPerson(user.name, user.id, user.email);
 
     const lists = await this.prisma.list.findMany({ where: { spaceId } });
     for (const list of lists) {
@@ -173,7 +179,7 @@ export class TasksService {
       const user = await this.prisma.user.findFirst({
         where: { name: { equals: list.name.trim(), mode: 'insensitive' } },
       });
-      if (user) addPerson(user.name, user.id);
+      if (user) addPerson(user.name, user.id, user.email);
     }
 
     const assigned = await this.prisma.task.findMany({
@@ -188,7 +194,7 @@ export class TasksService {
     for (const t of assigned) {
       if (t.assigneeId && userById.get(t.assigneeId)) {
         const u = userById.get(t.assigneeId)!;
-        addPerson(u.name, u.id);
+        addPerson(u.name, u.id, u.email);
       } else if (t.assigneeName) {
         addPerson(t.assigneeName, null);
       }
@@ -238,6 +244,11 @@ export class TasksService {
       },
     });
     await this.syncTaskAssignees(task.id, assignee.assigneeId);
+    await this.notifications.notifyTaskAssigned(userId, assignee.assigneeId, {
+      id: task.id,
+      title: task.title,
+      workspaceId: list.space.workspaceId,
+    });
     return task;
   }
 
@@ -277,11 +288,15 @@ export class TasksService {
 
   async findOne(userId: string, taskId: string) {
     const task = await this.assertTaskAccess(userId, taskId);
-    const [subtasks, nextActions, comments, attachments] = await Promise.all([
+    const [subtasks, nextActions, comments, attachments, activityLogs, assignee] = await Promise.all([
       this.prisma.task.findMany({ where: { parentTaskId: taskId }, orderBy: { position: 'asc' } }),
       this.prisma.nextActionEntry.findMany({ where: { taskId }, orderBy: { createdAt: 'desc' } }),
       this.prisma.comment.findMany({ where: { taskId }, orderBy: { createdAt: 'asc' } }),
       this.prisma.attachment.findMany({ where: { taskId } }),
+      this.prisma.activityLog.findMany({ where: { taskId }, orderBy: { createdAt: 'desc' }, take: 20 }),
+      task.assigneeId
+        ? this.prisma.user.findUnique({ where: { id: task.assigneeId }, select: { email: true, emailVerified: true } })
+        : Promise.resolve(null),
     ]);
     return {
       ...task,
@@ -289,6 +304,9 @@ export class TasksService {
       nextActions,
       comments,
       attachments,
+      activityLogs,
+      assigneeEmail: assignee?.emailVerified ? assignee.email : null,
+      assigneeEmailUnverified: assignee && !assignee.emailVerified ? assignee.email : null,
       customFieldDefs: task.list.space.customFields,
     };
   }
@@ -328,8 +346,38 @@ export class TasksService {
         ...(dto.customFieldValues !== undefined ? { customFields: dto.customFieldValues } : {}),
       },
     });
+    const workspaceId = task.list.space.workspaceId;
+    const activityTask = {
+      id: updated.id,
+      title: updated.title,
+      workspaceId,
+      assigneeId: updated.assigneeId,
+      createdById: updated.createdById,
+    };
     if (assigneePatch) {
       await this.syncTaskAssignees(taskId, assigneePatch.assigneeId);
+      if (assigneePatch.assigneeId && assigneePatch.assigneeId !== task.assigneeId) {
+        await this.notifications.notifyTaskReassigned(userId, assigneePatch.assigneeId, activityTask);
+      }
+    }
+    if (dto.statusId && dto.statusId !== task.statusId) {
+      const oldStatus = task.list.space.statuses.find((s: { id: string }) => s.id === task.statusId);
+      const newStatus = task.list.space.statuses.find((s: { id: string }) => s.id === dto.statusId);
+      if (oldStatus && newStatus) {
+        const wasDone = oldStatus.type === 'done';
+        const isDone = newStatus.type === 'done';
+        if (!wasDone && isDone) await this.notifications.notifyCompleted(userId, activityTask);
+        else if (wasDone && !isDone) await this.notifications.notifyReopened(userId, activityTask);
+        else await this.notifications.notifyStatusChanged(userId, activityTask.assigneeId, activityTask, newStatus.name);
+      }
+    }
+    if (dto.priority !== undefined && (dto.priority || '') !== (task.priority || '')) {
+      await this.notifications.notifyPriorityChanged(
+        userId,
+        activityTask.assigneeId,
+        activityTask,
+        dto.priority || 'None',
+      );
     }
     return updated;
   }
@@ -353,11 +401,31 @@ export class TasksService {
     });
   }
 
-  async addComment(userId: string, taskId: string, dto: AddCommentDto) {
+  async removeNextAction(userId: string, taskId: string, entryId: string) {
     await this.assertTaskAccess(userId, taskId);
-    return this.prisma.comment.create({
+    const entry = await this.prisma.nextActionEntry.findUnique({ where: { id: entryId } });
+    if (!entry || entry.taskId !== taskId) {
+      throw new NotFoundException('Next action entry not found');
+    }
+    await this.prisma.nextActionEntry.delete({ where: { id: entryId } });
+    return { id: entryId, deleted: true };
+  }
+
+  async addComment(userId: string, taskId: string, dto: AddCommentDto) {
+    const task = await this.assertTaskAccess(userId, taskId);
+    const comment = await this.prisma.comment.create({
       data: { taskId, userId, authorName: dto.authorName || null, body: dto.body },
     });
+    const activityTask = {
+      id: task.id,
+      title: task.title,
+      workspaceId: task.list.space.workspaceId,
+      assigneeId: task.assigneeId,
+      createdById: task.createdById,
+    };
+    await this.notifications.notifyComment(userId, comment.id, activityTask);
+    await this.notifications.notifyMentions(userId, comment.id, dto.body, activityTask);
+    return comment;
   }
 
   async removeComment(userId: string, taskId: string, commentId: string) {
@@ -427,6 +495,11 @@ export class TasksService {
       },
     });
     await this.syncTaskAssignees(copy.id, task.assigneeId);
+    await this.notifications.notifyTaskAssigned(userId, copy.assigneeId, {
+      id: copy.id,
+      title: copy.title,
+      workspaceId: task.list.space.workspaceId,
+    });
     return copy;
   }
 
@@ -490,5 +563,55 @@ export class TasksService {
     await this.assertTaskAccess(userId, taskId);
     await this.prisma.task.delete({ where: { id: taskId } });
     return { id: taskId, deleted: true };
+  }
+
+  async locateTask(userId: string, taskId: string) {
+    const task = await this.assertTaskAccess(userId, taskId);
+    return {
+      id: task.id,
+      title: task.title,
+      listId: task.listId,
+      listName: task.list.name,
+      spaceId: task.list.space.id,
+      spaceName: task.list.space.name,
+    };
+  }
+
+  async sendTaskEmail(
+    userId: string,
+    taskId: string,
+    dto: { to: string[]; cc?: string[]; subject: string; body: string },
+  ) {
+    if (!dto.to.length) throw new BadRequestException('Add at least one recipient');
+    const task = await this.assertTaskAccess(userId, taskId);
+    return this.emails.sendTaskEmail({
+      taskId: task.id,
+      workspaceId: task.list.space.workspaceId,
+      senderId: userId,
+      to: dto.to,
+      cc: dto.cc,
+      subject: dto.subject,
+      body: dto.body,
+      kind: 'manual',
+    });
+  }
+
+  async retryTaskEmail(userId: string, taskId: string, emailId: string) {
+    await this.assertTaskAccess(userId, taskId);
+    const row = await this.prisma.taskEmail.findFirst({ where: { id: emailId, taskId } });
+    if (!row) throw new NotFoundException('Email not found');
+    const saved = await this.emails.retry(emailId);
+    if (saved?.status === 'sent' && saved.taskId) {
+      await this.prisma.activityLog.create({
+        data: {
+          workspaceId: saved.workspaceId,
+          taskId: saved.taskId,
+          userId,
+          action: `Email sent to ${saved.recipientEmail}`,
+          meta: { taskEmailId: saved.id, recipientEmail: saved.recipientEmail },
+        },
+      });
+    }
+    return saved;
   }
 }

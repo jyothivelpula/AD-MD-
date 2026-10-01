@@ -30,6 +30,20 @@ export class AiController {
     return this.ai.picker(user.id, workspaceId, q);
   }
 
+  @Get('daily-brief')
+  dailyBrief(
+    @CurrentUser() user: { id: string },
+    @Param('workspaceId') workspaceId: string,
+    @Query('generate') generate?: string,
+  ) {
+    return this.ai.dailyBrief(user.id, workspaceId, generate === '1');
+  }
+
+  @Post('daily-brief/refresh')
+  refreshDailyBrief(@CurrentUser() user: { id: string }, @Param('workspaceId') workspaceId: string) {
+    return this.ai.dailyBrief(user.id, workspaceId, true);
+  }
+
   @Get('chats')
   listChats(@CurrentUser() user: { id: string }, @Param('workspaceId') workspaceId: string) {
     return this.ai.listChats(user.id, workspaceId);

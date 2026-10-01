@@ -80,6 +80,15 @@ export class TasksController {
     return this.tasksService.updateNextAction(user.id, id, entryId, dto);
   }
 
+  @Delete(':id/next-actions/:entryId')
+  removeNextAction(
+    @CurrentUser() user: { id: string },
+    @Param('id') id: string,
+    @Param('entryId') entryId: string,
+  ) {
+    return this.tasksService.removeNextAction(user.id, id, entryId);
+  }
+
   @Post(':id/comments')
   addComment(
     @CurrentUser() user: { id: string },

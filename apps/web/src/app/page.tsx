@@ -3,6 +3,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { apiFetch, API_URL } from '@/lib/api';
 import AiChatPanel from '@/components/ai/AiChatPanel';
+import NotificationBell from '@/components/notifications/NotificationBell';
+import NotificationCenter from '@/components/notifications/NotificationCenter';
+import NotificationSettings from '@/components/notifications/NotificationSettings';
 import AiIcon from '@/components/ai/AiIcon';
 import type { AiChatSummary, AiContext, AiTaskCard } from '@/components/ai/types';
 import WorkspaceSearch, { SearchTrigger, type SearchListHit, type SearchPersonHit, type SearchSpaceHit, type SearchTaskHit } from '@/components/search/WorkspaceSearch';
@@ -11,9 +14,9 @@ type User = { id: string; email: string; name: string };
 type Workspace = { id: string; name: string };
 type Status = { id: string; name: string; color: string; order: number; type?: string };
 type Space = { id: string; name: string; statuses: Status[] };
-type List = { id: string; name: string; spaceId: string; kind?: 'list' | 'person'; userId?: string; personKey?: string };
+type List = { id: string; name: string; spaceId: string; kind?: 'list' | 'person'; userId?: string; personKey?: string; email?: string | null };
 type Member = { id: string; userId: string; role: string; name: string; email: string };
-type Person = { key: string; userId: string | null; name: string };
+type Person = { key: string; userId: string | null; name: string; email?: string | null };
 type NextActionEntry = { id: string; text: string; createdAt: string };
 type CustomField = { id: string; name: string; type: string; config?: any };
 type Comment = { id: string; body: string; authorName?: string | null; createdAt: string };
@@ -39,10 +42,14 @@ type Task = {
   customFields?: Record<string, any> | null;
 };
 type TaskDetail = Task & {
+  listId?: string;
   subtasks: Task[];
   nextActions: NextActionEntry[];
   comments: Comment[];
   attachments: Attachment[];
+  activityLogs?: { id: string; action: string; createdAt: string }[];
+  assigneeEmail?: string | null;
+  assigneeEmailUnverified?: string | null;
   customFieldDefs: CustomField[];
 };
 
@@ -123,6 +130,22 @@ function personViewKey(userId: string) {
   return `person:${userId}`;
 }
 
+function isPlaceholderEmail(email?: string | null) {
+  return !!email && /@example\.com$/i.test(email.trim());
+}
+
+function isValidEmail(email: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+}
+
+function latestDailyLog(entries: { text: string; createdAt: string }[] | undefined) {
+  if (!entries?.length) return '';
+  const latest = [...entries]
+    .filter((entry) => typeof entry.text === 'string' && entry.text.trim() !== '')
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+  return latest ? latest.text.replace(/\r\n/g, '\n') : '';
+}
+
 function isPersonView(list: List) {
   return list.kind === 'person';
 }
@@ -131,6 +154,7 @@ function makePersonList(person: Person, space: Space): List {
   return {
     id: personViewKey(person.key),
     name: person.name,
+    email: person.email || null,
     spaceId: space.id,
     kind: 'person',
     userId: person.userId || undefined,
@@ -330,10 +354,21 @@ function saveRecentTasks(entries: RecentTaskEntry[]) {
   } catch {}
 }
 
-export default function Home() {
+export default function Home({ initialView }: { initialView?: 'notifications' | 'notification-settings' } = {}) {
   // theme / appearance
   const [theme, setTheme] = useState<Theme>(DEFAULT_THEME);
+  const [centerView, setCenterView] = useState<'notifications' | 'notification-settings' | null>(initialView ?? null);
+  const [aiBriefToken, setAiBriefToken] = useState(0);
   const [themePanelOpen, setThemePanelOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileEmail, setProfileEmail] = useState('');
+  const [profileNotice, setProfileNotice] = useState('');
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [manageUser, setManageUser] = useState<{ userId: string; name: string; email: string } | null>(null);
+  const [manageName, setManageName] = useState('');
+  const [manageEmail, setManageEmail] = useState('');
+  const [manageNotice, setManageNotice] = useState('');
+  const [manageBusy, setManageBusy] = useState(false);
 
   // auth state
   const [user, setUser] = useState<User | null>(null);
@@ -463,6 +498,7 @@ export default function Home() {
 
   // List view (ClickUp-style List/Board toolbar for a whole List, not a single task)
   const [viewingList, setViewingList] = useState<{ list: List; space: Space } | null>(null);
+  const [aiListedTasks, setAiListedTasks] = useState<AiTaskCard[] | null>(null);
 
   // "Where I left off" — see LastView/RecentTaskEntry types above.
   const [recentTasks, setRecentTasks] = useState<RecentTaskEntry[]>([]);
@@ -513,7 +549,43 @@ export default function Home() {
     }
   }
 
+  function leaveNotificationViews() {
+    setCenterView(null);
+    if (typeof window === 'undefined') return;
+    const path = window.location.pathname;
+    if (path === '/notifications' || path === '/settings/notifications') {
+      window.history.pushState(null, '', '/');
+    }
+  }
+
+  function showNotificationCenter() {
+    setAiOpen(false);
+    setCenterView('notifications');
+    if (typeof window !== 'undefined' && window.location.pathname !== '/notifications') {
+      window.history.pushState(null, '', '/notifications');
+    }
+  }
+
+  function openDailyBrief() {
+    setCenterView(null);
+    setAiOpen(true);
+    setAiBriefToken((value) => value + 1);
+    if (typeof window !== 'undefined' && window.location.pathname !== '/') {
+      window.history.pushState(null, '', '/');
+    }
+  }
+
+  function showNotificationSettings() {
+    setAiOpen(false);
+    setCenterView('notification-settings');
+    if (typeof window !== 'undefined' && window.location.pathname !== '/settings/notifications') {
+      window.history.pushState(null, '', '/settings/notifications');
+    }
+  }
+
   function openListView(list: List, space: Space) {
+    leaveNotificationViews();
+    setAiListedTasks(null);
     setViewingList({ list, space });
     closeTaskDetail();
     if (!tasksByList[list.id]) refreshTasksFor(list, space);
@@ -523,8 +595,10 @@ export default function Home() {
   }
 
   function goHome() {
+    leaveNotificationViews();
     closeTaskDetail();
     setViewingList(null);
+    setAiListedTasks(null);
     setAiOpen(false);
     clearLastView();
   }
@@ -559,6 +633,7 @@ export default function Home() {
 
   function openAiHome() {
     if (!selectedWorkspace) return;
+    leaveNotificationViews();
     closeTaskDetail();
     setViewingList(null);
     setAiContext(workspaceAiContext());
@@ -581,6 +656,7 @@ export default function Home() {
 
   async function openAiWorkspace(opts?: { newChat?: boolean; chatId?: string; context?: AiContext }) {
     if (!selectedWorkspace) return;
+    leaveNotificationViews();
     const ctx = opts?.context || aiContext || workspaceAiContext();
     closeTaskDetail();
     setViewingList(null);
@@ -640,7 +716,20 @@ export default function Home() {
     }
   }
 
-  async function openTaskFromAi(task: AiTaskCard) {
+  function viewTasksFromAi(tasks: AiTaskCard[]) {
+    if (!tasks.length) return;
+    setAiListedTasks(tasks);
+    setAiOpen(false);
+    closeTaskDetail();
+    setViewingList(null);
+    setExpandedSpaces((prev) => {
+      const next = new Set(prev);
+      for (const task of tasks) next.add(task.spaceId);
+      return next;
+    });
+  }
+
+  async function openTaskFromAi(task: AiTaskCard, options?: { onMissing?: () => void }): Promise<boolean> {
     setAiOpen(false);
     let space = spaces.find((s) => s.id === task.spaceId) || null;
     if (!space && selectedWorkspace) {
@@ -649,13 +738,21 @@ export default function Home() {
         setSpaces(data);
         space = data.find((s) => s.id === task.spaceId) || null;
       } catch (err: any) {
+        if (options?.onMissing) {
+          options.onMissing();
+          return false;
+        }
         setError(err.message);
-        return;
+        return false;
       }
     }
     if (!space) {
+      if (options?.onMissing) {
+        options.onMissing();
+        return false;
+      }
       setError('Could not open that task — space not found.');
-      return;
+      return false;
     }
     let lists = listsBySpace[space.id] || [];
     if (!listsBySpace[space.id]) {
@@ -671,7 +768,9 @@ export default function Home() {
       name: task.listName,
       spaceId: space.id,
     };
-    await openTaskDetail(list, space, task.id);
+    const opened = await openTaskDetail(list, space, task.id, undefined, options);
+    if (opened) leaveNotificationViews();
+    return opened;
   }
 
   async function resolveSpace(spaceId: string): Promise<Space | null> {
@@ -805,6 +904,16 @@ export default function Home() {
   const [openTaskMenu, setOpenTaskMenu] = useState<{ listId: string; taskId: string } | null>(null);
   const [moveDialogTask, setMoveDialogTask] = useState<{ list: List; task: Task } | null>(null);
   const [moveDialogTargetListId, setMoveDialogTargetListId] = useState('');
+  const [emailOpen, setEmailOpen] = useState(false);
+  const [emailTo, setEmailTo] = useState('');
+  const [emailCc, setEmailCc] = useState('');
+  const [emailSubject, setEmailSubject] = useState('');
+  const [emailBody, setEmailBody] = useState('');
+  const [emailAttach, setEmailAttach] = useState<string[]>([]);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailNotice, setEmailNotice] = useState('');
+  const [emailSentNotice, setEmailSentNotice] = useState('');
+  const [emailRetryId, setEmailRetryId] = useState<string | null>(null);
   const [mergeDialogTask, setMergeDialogTask] = useState<{ list: List; task: Task } | null>(null);
   const [mergeDialogTargetTaskId, setMergeDialogTargetTaskId] = useState('');
 
@@ -823,7 +932,25 @@ export default function Home() {
     if (token && storedUser) {
       setUser(JSON.parse(storedUser));
       loadWorkspaces();
+      apiFetch('/auth/me')
+        .then((me: User) => {
+          const next = { id: me.id, email: me.email, name: me.name };
+          localStorage.setItem('user', JSON.stringify(next));
+          setUser(next);
+        })
+        .catch(() => undefined);
     }
+  }, []);
+
+  useEffect(() => {
+    function onPop() {
+      const path = window.location.pathname;
+      if (path === '/notifications') setCenterView('notifications');
+      else if (path === '/settings/notifications') setCenterView('notification-settings');
+      else setCenterView(null);
+    }
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
   }, []);
 
   useEffect(() => {
@@ -948,6 +1075,105 @@ export default function Home() {
     setAiChatId(null);
     setAiChats([]);
     setAiContext(null);
+  }
+
+  async function saveProfileEmail(e: React.FormEvent) {
+    e.preventDefault();
+    if (!user) return;
+    const next = profileEmail.trim().toLowerCase();
+    if (!isValidEmail(next)) {
+      setProfileNotice('Enter a valid email address.');
+      return;
+    }
+    setProfileBusy(true);
+    setProfileNotice('');
+    try {
+      const saved: { accessToken?: string; user?: User; email: string; verificationSent?: boolean } = await apiFetch('/auth/email', {
+        method: 'POST',
+        body: JSON.stringify({ email: next }),
+      });
+      const updated: User = saved.user?.email ? saved.user : { ...user, email: saved.email };
+      if (saved.accessToken) localStorage.setItem('token', saved.accessToken);
+      localStorage.setItem('user', JSON.stringify(updated));
+      setUser(updated);
+      setMembers((prev) => prev.map((member) => (member.userId === updated.id ? { ...member, email: updated.email } : member)));
+      setPeopleBySpace((prev) => {
+        const copy = { ...prev };
+        for (const spaceId of Object.keys(copy)) {
+          copy[spaceId] = copy[spaceId].map((person) =>
+            person.userId === updated.id ? { ...person, email: updated.email } : person,
+          );
+        }
+        return copy;
+      });
+      setProfileNotice(
+        saved.verificationSent
+          ? 'Email saved. Check your inbox to verify it before automatic task emails are sent.'
+          : 'Email saved. People, assignees, and future notifications use this address. Verify it before automatic emails are sent.',
+      );
+    } catch (err: any) {
+      setProfileNotice(err.message || 'Could not save that email.');
+    } finally {
+      setProfileBusy(false);
+    }
+  }
+
+  function openManageUser(person: { userId: string; name: string; email?: string | null }) {
+    setManageUser({ userId: person.userId, name: person.name, email: person.email || '' });
+    setManageName(person.name);
+    setManageEmail(person.email || '');
+    setManageNotice('');
+  }
+
+  async function saveManagedUser(e: React.FormEvent) {
+    e.preventDefault();
+    if (!manageUser || !selectedWorkspace || !user) return;
+    const email = manageEmail.trim().toLowerCase();
+    const name = manageName.trim();
+    if (!name) {
+      setManageNotice('Name is required.');
+      return;
+    }
+    if (!isValidEmail(email)) {
+      setManageNotice('Enter a valid email address.');
+      return;
+    }
+    setManageBusy(true);
+    setManageNotice('');
+    try {
+      const saved: { userId: string; name: string; email: string } = await apiFetch(
+        `/workspaces/${selectedWorkspace.id}/members/${manageUser.userId}`,
+        { method: 'PATCH', body: JSON.stringify({ name, email }) },
+      );
+      setMembers((prev) => prev.map((member) => (member.userId === saved.userId ? { ...member, name: saved.name, email: saved.email } : member)));
+      setPeopleBySpace((prev) => {
+        const copy = { ...prev };
+        for (const spaceId of Object.keys(copy)) {
+          copy[spaceId] = copy[spaceId].map((person) =>
+            person.userId === saved.userId ? { ...person, name: saved.name, email: saved.email } : person,
+          );
+        }
+        return copy;
+      });
+      if (user.id === saved.userId) {
+        const next = { ...user, name: saved.name, email: saved.email };
+        localStorage.setItem('user', JSON.stringify(next));
+        setUser(next);
+      }
+      await Promise.all(
+        spaces
+          .filter((space) => peopleBySpace[space.id])
+          .map(async (space) => {
+            const people: Person[] = await apiFetch(`/spaces/${space.id}/people`);
+            setPeopleBySpace((prev) => ({ ...prev, [space.id]: people }));
+          }),
+      );
+      setManageUser(null);
+    } catch (err: any) {
+      setManageNotice(err.message || 'Could not save that user.');
+    } finally {
+      setManageBusy(false);
+    }
   }
 
   // ---- workspaces ----
@@ -1075,7 +1301,7 @@ export default function Home() {
 
   function peopleForSpace(spaceId: string): Person[] {
     if (peopleBySpace[spaceId]?.length) return peopleBySpace[spaceId];
-    return members.map((m) => ({ key: m.userId, userId: m.userId, name: m.name }));
+        return members.map((m) => ({ key: m.userId, userId: m.userId, name: m.name, email: m.email }));
   }
 
   async function loadSpaceListsAndPeople(space: Space) {
@@ -1490,15 +1716,22 @@ export default function Home() {
 
   // ---- task detail (full main-panel view) ----
 
-  async function openTaskDetail(list: List, space: Space, taskId: string, task?: Task) {
+  async function openTaskDetail(
+    list: List,
+    space: Space,
+    taskId: string,
+    task?: Task,
+    options?: { onMissing?: () => void },
+  ): Promise<boolean> {
     try {
       if (!peopleBySpace[space.id]) {
         const peopleList: Person[] = await apiFetch(`/spaces/${space.id}/people`).catch(() => []);
         setPeopleBySpace((prev) => ({ ...prev, [space.id]: peopleList }));
       }
       const apiListId = canonicalListId(list, task);
-      if (!apiListId) return;
+      if (!apiListId) return false;
       const data: TaskDetail = await apiFetch(`/lists/${apiListId}/tasks/${taskId}`);
+      if (detailTask?.id !== taskId) setEmailSentNotice('');
       setDetailTask(data);
       setDetailListId(data.listId || apiListId);
       setDetailSpace(space);
@@ -1550,12 +1783,96 @@ export default function Home() {
           return next;
         });
       }
+      return true;
     } catch (err: any) {
+      if (options?.onMissing && /not found/i.test(err.message || '')) {
+        options.onMissing();
+        return false;
+      }
       setError(err.message);
+      return false;
     }
   }
 
+  function openEmailComposer() {
+    if (!detailTask) return;
+    setEmailTo(detailTask.assigneeEmail || '');
+    setEmailCc('');
+    setEmailSubject(detailTask.title);
+    const draft = nextActionText.replace(/\r\n/g, '\n').trim();
+    setEmailBody(draft || latestDailyLog(detailTask.nextActions));
+    setEmailAttach([]);
+    setEmailRetryId(null);
+    setEmailNotice(
+      detailTask.assigneeEmailUnverified
+        ? 'The assignee email is not verified yet. Enter a recipient before sending.'
+        : '',
+    );
+    setEmailOpen(true);
+  }
+
+  async function submitTaskEmail(retry = false) {
+    if (!detailTask || !detailListId || !detailSpace) return;
+    const to = emailTo.split(/[,;\s]+/).map((item) => item.trim()).filter(Boolean);
+    const cc = emailCc.split(/[,;\s]+/).map((item) => item.trim()).filter(Boolean);
+    const attachments = detailTask.attachments.filter((item) => emailAttach.includes(item.id));
+    const attachmentText = attachments.map((item) => `${item.name}: ${API_URL}${item.url}`).join('\n');
+    const body = [emailBody.trim(), attachmentText ? `Attachments:\n${attachmentText}` : ''].filter(Boolean).join('\n\n');
+    if (!retry && (!to.length || !emailSubject.trim() || !body)) {
+      setEmailNotice('Add a recipient, subject, and message.');
+      return;
+    }
+    setEmailBusy(true);
+    setEmailNotice('');
+    try {
+      const result: { id: string; status: string; success?: boolean; error?: string | null; recipientEmail?: string } =
+        retry && emailRetryId
+          ? await apiFetch(`/tasks/${detailTask.id}/emails/${emailRetryId}/retry`, { method: 'POST' })
+          : await apiFetch(`/tasks/${detailTask.id}/email`, {
+              method: 'POST',
+              body: JSON.stringify({ to, cc, subject: emailSubject.trim(), body }),
+            });
+      if (result.status !== 'sent' || result.success === false) {
+        setEmailRetryId(result.id);
+        setEmailNotice(result.error || 'Email failed to send.');
+        return;
+      }
+      const sentTo = retry ? result.recipientEmail || emailTo.trim() : to.join(', ');
+      setEmailOpen(false);
+      setEmailRetryId(null);
+      await openTaskDetail({ id: detailListId, name: '', spaceId: detailSpace.id }, detailSpace, detailTask.id);
+      setEmailSentNotice(sentTo ? `Mail was sent to ${sentTo}.` : 'Mail was sent.');
+    } catch (err: any) {
+      setEmailNotice(err.message || 'Email failed to send.');
+    } finally {
+      setEmailBusy(false);
+    }
+  }
+
+  const deepLinkTried = useRef(false);
+  useEffect(() => {
+    if (!user || !selectedWorkspace || spaces.length === 0 || deepLinkTried.current) return;
+    const taskId = new URLSearchParams(window.location.search).get('taskId');
+    if (!taskId) return;
+    deepLinkTried.current = true;
+    (async () => {
+      try {
+        const loc: { id: string; title: string; listId: string; listName: string; spaceId: string } = await apiFetch(`/tasks/${taskId}`);
+        const space = spaces.find((item) => item.id === loc.spaceId);
+        if (!space) {
+          setError('Related task is no longer available.');
+          return;
+        }
+        const opened = await openTaskDetail({ id: loc.listId, name: loc.listName, spaceId: loc.spaceId }, space, loc.id);
+        if (!opened) setError('Related task is no longer available.');
+      } catch {
+        setError('Related task is no longer available.');
+      }
+    })();
+  }, [user, selectedWorkspace, spaces]);
+
   function closeTaskDetail() {
+    setEmailSentNotice('');
     setDetailTask(null);
     setDetailListId(null);
     setDetailSpace(null);
@@ -1694,6 +2011,24 @@ export default function Home() {
       });
       setEditingNextActionId(null);
       setEditingNextActionText('');
+      const list: List = { id: detailListId, name: '', spaceId: detailSpace.id };
+      await openTaskDetail(list, detailSpace, detailTask.id);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  }
+
+  async function deleteNextAction(entryId: string) {
+    if (!detailTask || !detailListId || !detailSpace) return;
+    if (!confirm('Delete this daily log?')) return;
+    try {
+      await apiFetch(`/lists/${detailListId}/tasks/${detailTask.id}/next-actions/${entryId}`, {
+        method: 'DELETE',
+      });
+      if (editingNextActionId === entryId) {
+        setEditingNextActionId(null);
+        setEditingNextActionText('');
+      }
       const list: List = { id: detailListId, name: '', spaceId: detailSpace.id };
       await openTaskDetail(list, detailSpace, detailTask.id);
     } catch (err: any) {
@@ -2211,10 +2546,26 @@ export default function Home() {
                           <>
                             <button
                               onClick={() => toggleList(list, space)}
-                              className="flex-1 text-left px-1.5 py-1 rounded-lg hover:bg-current/10"
+                              className="flex-1 text-left px-1.5 py-1 rounded-lg hover:bg-current/10 min-w-0"
                             >
-                              {isPersonView(list) ? '👤' : '📋'} {list.name}
+                              <span className="block truncate">{isPersonView(list) ? '👤' : '📋'} {list.name}</span>
+                              {isPersonView(list) && list.email && (
+                                <span className="block truncate text-[11px] opacity-60">
+                                  {list.email}
+                                  {isPlaceholderEmail(list.email) ? ' · placeholder' : ''}
+                                </span>
+                              )}
                             </button>
+                            {isPersonView(list) &&
+                              list.userId &&
+                              members.some((member) => member.userId === user.id && (member.role === 'owner' || member.role === 'admin')) && (
+                                <button
+                                  onClick={() => openManageUser({ userId: list.userId!, name: list.name, email: list.email })}
+                                  className="text-[11px] opacity-60 hover:opacity-100 shrink-0 pr-1"
+                                >
+                                  Manage
+                                </button>
+                              )}
                             <span className="hidden group-hover:flex gap-1 pr-1 text-xs">
                               <button onClick={() => openListView(list, space)} className="opacity-60 hover:opacity-100" title="Open List/Board view with filters & search">View</button>
                               {!isPersonView(list) && (
@@ -2394,7 +2745,7 @@ export default function Home() {
                                             <option value="">Unassigned</option>
                                             {peopleForSpace(space.id).map((p) => (
                                               <option key={p.key} value={p.key}>
-                                                {p.name}
+                                                {p.email ? `${p.name} — ${p.email}` : p.name}
                                               </option>
                                             ))}
                                           </select>
@@ -2488,24 +2839,70 @@ export default function Home() {
           ))}
         </div>
 
-        <div className="p-3 border-t border-current/15 flex items-center justify-between">
-          <span className="text-xs opacity-70">{user.name}</span>
-          <div className="flex items-center gap-3">
-            <button onClick={() => setThemePanelOpen(true)} className="text-xs opacity-70 hover:opacity-100" title="Customize colors">
-              🎨
-            </button>
-            <button onClick={handleLogout} className="text-xs text-red-400 underline">
-              Log out
-            </button>
+        <div className="p-3 border-t border-current/15">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <span className="block text-xs opacity-70 truncate">{user.name}</span>
+              <span className="block text-[11px] opacity-60 truncate">{user.email}</span>
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              <button
+                onClick={() => {
+                  setProfileEmail(user.email);
+                  setProfileNotice('');
+                  setProfileOpen((open) => !open);
+                }}
+                className="text-xs opacity-70 hover:opacity-100"
+              >
+                Profile
+              </button>
+              <button onClick={() => setThemePanelOpen(true)} className="text-xs opacity-70 hover:opacity-100" title="Customize colors">
+                🎨
+              </button>
+              <button onClick={handleLogout} className="text-xs text-red-400 underline">
+                Log out
+              </button>
+            </div>
           </div>
+          {profileOpen && (
+            <form onSubmit={saveProfileEmail} className="mt-2 space-y-1.5">
+              {isPlaceholderEmail(user.email) && (
+                <p className="text-[11px] opacity-70">This is a placeholder address. Replace it with your email.</p>
+              )}
+              <input
+                type="email"
+                required
+                className="w-full border rounded-lg px-2 py-1 text-sm text-black"
+                value={profileEmail}
+                onChange={(e) => setProfileEmail(e.target.value)}
+                placeholder="name@email.com"
+              />
+              {profileNotice && <p className="text-[11px] opacity-80">{profileNotice}</p>}
+              <button
+                type="submit"
+                disabled={profileBusy}
+                className="text-xs text-white px-2 py-1 rounded-lg disabled:opacity-50"
+                style={{ backgroundColor: theme.accent }}
+              >
+                {profileBusy ? 'Saving...' : 'Save email'}
+              </button>
+            </form>
+          )}
         </div>
       </aside>
 
       {/* Main panel — empty state, or the full task detail page */}
-      <section className="flex-1 min-h-0 flex flex-col overflow-hidden">
+      <section className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
         {!aiOpen && selectedWorkspace && (
           <header className="h-[52px] shrink-0 flex items-center justify-center gap-2 px-6 bg-white/90 border-b border-black/[0.04]">
             <SearchTrigger onClick={() => setSearchOpen(true)} wide />
+            <NotificationBell
+              workspaceId={selectedWorkspace.id}
+              onOpenTask={(task) =>
+                openTaskFromAi(task, { onMissing: () => setError('Related task is no longer available.') })
+              }
+              onViewAll={showNotificationCenter}
+            />
             <button
               type="button"
               onClick={() => openAiWorkspace()}
@@ -2515,7 +2912,7 @@ export default function Home() {
             </button>
           </header>
         )}
-        <div className={`flex-1 min-h-0 ${aiOpen ? 'overflow-hidden' : 'overflow-y-auto'}`} onClick={() => aiMenuFor && setAiMenuFor(null)}>
+        <div className={`flex-1 min-h-0 relative ${aiOpen ? 'overflow-hidden' : 'overflow-y-auto'}`} onClick={() => aiMenuFor && setAiMenuFor(null)}>
         {aiOpen && selectedWorkspace ? (
           <AiChatPanel
             workspaceId={selectedWorkspace.id}
@@ -2527,7 +2924,9 @@ export default function Home() {
             onEnsureChat={ensureAiChat}
             onChatUpdated={() => loadAiChats(selectedWorkspace.id)}
             onOpenTask={openTaskFromAi}
+            onViewTasks={viewTasksFromAi}
             onOpenSearch={() => setSearchOpen(true)}
+            openBriefToken={aiBriefToken}
           />
         ) : (
           <>
@@ -2539,7 +2938,28 @@ export default function Home() {
         )}
         {error && <p className="text-red-600 text-sm px-6 pt-4">{error}</p>}
 
-        {!detailTask && !viewingList && (() => {
+        {!detailTask && !viewingList && aiListedTasks && aiListedTasks.length > 0 && (
+          <div className="p-8 max-w-2xl">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold">Tasks ({aiListedTasks.length})</h2>
+              <button onClick={() => setAiListedTasks(null)} className="text-xs text-gray-400 hover:text-gray-700">Close</button>
+            </div>
+            <div className="space-y-1">
+              {aiListedTasks.map((task) => (
+                <button
+                  key={task.id}
+                  onClick={() => openTaskFromAi(task)}
+                  className="w-full text-left bg-gray-50 hover:bg-gray-100 border rounded-lg px-3 py-2 text-sm flex items-center justify-between gap-3"
+                >
+                  <span className="truncate">{task.title}</span>
+                  <span className="text-xs opacity-60 shrink-0">{task.spaceName} / {task.listName}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {!detailTask && !viewingList && !aiListedTasks && (() => {
           const myRecent = recentTasks.filter((r) => r.workspaceId === selectedWorkspace?.id);
           const hasAnything = overdueTasksList.length > 0 || myRecent.length > 0;
           const hour = new Date().getHours();
@@ -2980,6 +3400,14 @@ export default function Home() {
                   ⚭ Merge
                 </button>
                 <button
+                  onClick={openEmailComposer}
+                  className="text-gray-400"
+                  onMouseEnter={(e) => (e.currentTarget.style.color = theme.accent)}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = '')}
+                >
+                  ✉ Email
+                </button>
+                <button
                   onClick={() => detailListId && deleteTaskFromList({ id: detailListId, name: '', spaceId: detailSpace.id }, detailTask, detailSpace)}
                   className="text-gray-400 hover:text-red-600"
                 >
@@ -3014,6 +3442,12 @@ export default function Home() {
                 </div>
               </div>
             </div>
+
+            {emailSentNotice && (
+              <p className="mb-3 rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">
+                {emailSentNotice}
+              </p>
+            )}
 
             <input
               className="text-2xl font-bold w-full border-none outline-none mb-4"
@@ -3089,18 +3523,26 @@ export default function Home() {
                             </div>
                           </div>
                         ) : (
-                          <div className="group">
+                          <div>
                             <div className="flex items-start justify-between gap-2">
                               <p className="text-sm whitespace-pre-wrap flex-1">{na.text}</p>
-                              <button
-                                onClick={() => {
-                                  setEditingNextActionId(na.id);
-                                  setEditingNextActionText(na.text);
-                                }}
-                                className="text-xs opacity-0 group-hover:opacity-60 hover:!opacity-100 shrink-0"
-                              >
-                                Edit
-                              </button>
+                              <div className="flex gap-2 shrink-0">
+                                <button
+                                  onClick={() => {
+                                    setEditingNextActionId(na.id);
+                                    setEditingNextActionText(na.text);
+                                  }}
+                                  className="text-xs text-gray-500 hover:opacity-100"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  onClick={() => deleteNextAction(na.id)}
+                                  className="text-xs text-gray-400 hover:text-red-600"
+                                >
+                                  Delete
+                                </button>
+                              </div>
                             </div>
                             <p className="text-xs text-gray-400 mt-0.5">
                               {new Date(na.createdAt).toLocaleString()}
@@ -3200,18 +3642,29 @@ export default function Home() {
                     <option value="">Unassigned</option>
                     {peopleForSpace(detailSpace.id).map((p) => (
                       <option key={p.key} value={p.key}>
-                        {p.name}
+                        {p.email ? `${p.name} — ${p.email}` : p.name}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div>
                   <label className="text-xs font-semibold text-gray-500">🧑‍💼 Owner</label>
-                  <input
+                  <select
                     className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
                     value={detailForm.ownerName}
                     onChange={(e) => setDetailForm({ ...detailForm, ownerName: e.target.value })}
-                  />
+                  >
+                    <option value="">None</option>
+                    {detailForm.ownerName &&
+                      !peopleForSpace(detailSpace.id).some((p) => p.name === detailForm.ownerName) && (
+                        <option value={detailForm.ownerName}>{detailForm.ownerName}</option>
+                      )}
+                    {peopleForSpace(detailSpace.id).map((p) => (
+                      <option key={p.key} value={p.name}>
+                        {p.email ? `${p.name} — ${p.email}` : p.name}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
                 <div>
@@ -3562,13 +4015,40 @@ export default function Home() {
                 </div>
 
                 <div className="flex gap-2 mt-3">
-                  <input
-                    className="flex-1 border rounded-lg px-2 py-1.5 text-sm"
-                    placeholder="Write a comment..."
-                    value={commentText}
-                    onChange={(e) => setCommentText(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && addComment()}
-                  />
+                  <div className="relative flex-1">
+                    {(() => {
+                      const mention = commentText.match(/(?:^|\s)@([^\s@]*)$/);
+                      const query = mention ? mention[1].toLowerCase() : null;
+                      const suggestions = query === null
+                        ? []
+                        : members.filter((m) => m.name.toLowerCase().includes(query)).slice(0, 6);
+                      if (!suggestions.length) return null;
+                      return (
+                        <div className="absolute bottom-full left-0 z-20 mb-1 w-full rounded-lg border border-gray-200 bg-white shadow-md overflow-hidden">
+                          {suggestions.map((m) => (
+                            <button
+                              key={m.userId}
+                              type="button"
+                              className="block w-full text-left px-2 py-1.5 text-sm hover:bg-gray-50"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                setCommentText((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (full) => `${full.startsWith('@') ? '' : full[0]}@${m.name} `));
+                              }}
+                            >
+                              @{m.name}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
+                    <input
+                      className="w-full border rounded-lg px-2 py-1.5 text-sm"
+                      placeholder="Write a comment..."
+                      value={commentText}
+                      onChange={(e) => setCommentText(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && addComment()}
+                    />
+                  </div>
                   <button
                     onClick={addComment}
                     disabled={!commentText.trim()}
@@ -3639,11 +4119,27 @@ export default function Home() {
                   })}
                 </div>
                 <p className="text-xs text-gray-400 mt-2">
-                  Files are stored on your local API server for now. Emailing this task to others is still
-                  pending the Resend integration.
+                  Selected files can be included when you email this task from the header.
                 </p>
               </div>
               )}
+
+              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
+                <h3 className="text-xs font-semibold text-gray-500 mb-2">Activity</h3>
+                {(detailTask.activityLogs || []).length === 0 && (
+                  <p className="text-xs text-gray-400">No email activity yet.</p>
+                )}
+                <div className="space-y-1.5">
+                  {(detailTask.activityLogs || []).map((entry) => (
+                    <p key={entry.id} className="text-sm text-gray-700">
+                      {entry.action}
+                      <span className="block text-[11px] text-gray-400">
+                        {new Date(entry.createdAt).toLocaleString()}
+                      </span>
+                    </p>
+                  ))}
+                </div>
+              </div>
             </div>
 
             <div className="flex gap-2 py-6">
@@ -3664,6 +4160,21 @@ export default function Home() {
           </>
         )}
         </div>
+        {!aiOpen && centerView === 'notifications' && selectedWorkspace && (
+          <div className="absolute left-0 right-0 bottom-0 top-[52px] z-20 bg-[#f6f7f8] overflow-y-auto">
+            <NotificationCenter
+              workspaceId={selectedWorkspace.id}
+              onOpenTask={(task) => openTaskFromAi(task, { onMissing: () => {} })}
+              onOpenSettings={showNotificationSettings}
+              onViewBrief={openDailyBrief}
+            />
+          </div>
+        )}
+        {!aiOpen && centerView === 'notification-settings' && (
+          <div className="absolute left-0 right-0 bottom-0 top-[52px] z-20 bg-[#f6f7f8] overflow-y-auto">
+            <NotificationSettings onBack={showNotificationCenter} />
+          </div>
+        )}
       </section>
 
       {selectedWorkspace && (
@@ -3690,6 +4201,122 @@ export default function Home() {
             openAiWorkspace();
           }}
         />
+      )}
+
+      {manageUser && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+          <form onSubmit={saveManagedUser} className="bg-white rounded-xl shadow-2xl p-4 w-80">
+            <h3 className="font-semibold mb-3">Edit User</h3>
+            <label className="block text-xs font-semibold text-gray-500">Name</label>
+            <input
+              className="w-full border rounded-lg px-2 py-1.5 mt-1 mb-2 text-sm"
+              value={manageName}
+              onChange={(e) => setManageName(e.target.value)}
+              required
+            />
+            <label className="block text-xs font-semibold text-gray-500">Email</label>
+            <input
+              type="email"
+              className="w-full border rounded-lg px-2 py-1.5 mt-1 mb-2 text-sm"
+              value={manageEmail}
+              onChange={(e) => setManageEmail(e.target.value)}
+              required
+            />
+            {isPlaceholderEmail(manageUser.email) && (
+              <p className="text-[11px] text-gray-500 mb-2">This is a placeholder address. You can replace it.</p>
+            )}
+            {manageNotice && <p className="text-sm text-red-600 mb-2">{manageNotice}</p>}
+            <div className="flex gap-2 justify-end">
+              <button type="button" onClick={() => setManageUser(null)} className="text-gray-500 text-sm px-3 py-1.5">
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={manageBusy}
+                className="text-white text-sm px-3 py-1.5 rounded-lg disabled:opacity-50"
+                style={{ backgroundColor: theme.accent }}
+              >
+                {manageBusy ? 'Saving...' : 'Save Changes'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {emailOpen && detailTask && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-2xl p-4 w-[28rem] max-w-[92vw]">
+            <h3 className="font-semibold mb-3">Email “{detailTask.title}”</h3>
+            <label className="block text-xs font-semibold text-gray-500">To</label>
+            <input
+              className="w-full border rounded-lg px-2 py-1.5 mt-1 mb-2 text-sm"
+              value={emailTo}
+              onChange={(e) => setEmailTo(e.target.value)}
+              placeholder="name@example.com"
+            />
+            <label className="block text-xs font-semibold text-gray-500">CC</label>
+            <input
+              className="w-full border rounded-lg px-2 py-1.5 mt-1 mb-2 text-sm"
+              value={emailCc}
+              onChange={(e) => setEmailCc(e.target.value)}
+              placeholder="Optional"
+            />
+            <label className="block text-xs font-semibold text-gray-500">Subject</label>
+            <input
+              className="w-full border rounded-lg px-2 py-1.5 mt-1 mb-2 text-sm"
+              value={emailSubject}
+              onChange={(e) => setEmailSubject(e.target.value)}
+            />
+            <label className="block text-xs font-semibold text-gray-500">Message</label>
+            <textarea
+              className="w-full border rounded-lg px-2 py-1.5 mt-1 mb-2 text-sm min-h-24"
+              value={emailBody}
+              onChange={(e) => setEmailBody(e.target.value)}
+            />
+            {detailTask.attachments.length > 0 && (
+              <div className="mb-2">
+                <p className="text-xs font-semibold text-gray-500 mb-1">Attachments</p>
+                {detailTask.attachments.map((item) => (
+                  <label key={item.id} className="flex items-center gap-2 text-sm text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={emailAttach.includes(item.id)}
+                      onChange={(e) =>
+                        setEmailAttach((prev) =>
+                          e.target.checked ? [...prev, item.id] : prev.filter((id) => id !== item.id),
+                        )
+                      }
+                    />
+                    {item.name}
+                  </label>
+                ))}
+              </div>
+            )}
+            {emailNotice && <p className="text-sm text-red-600 mb-2">{emailNotice}</p>}
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setEmailOpen(false)} className="text-gray-500 text-sm px-3 py-1.5">
+                Cancel
+              </button>
+              {emailRetryId && (
+                <button
+                  onClick={() => submitTaskEmail(true)}
+                  disabled={emailBusy}
+                  className="text-sm px-3 py-1.5 rounded-lg border"
+                >
+                  Retry
+                </button>
+              )}
+              <button
+                onClick={() => submitTaskEmail(false)}
+                disabled={emailBusy}
+                className="text-white text-sm px-3 py-1.5 rounded-lg disabled:opacity-50"
+                style={{ backgroundColor: theme.accent }}
+              >
+                {emailBusy ? 'Sending...' : 'Send'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {moveDialogTask && (

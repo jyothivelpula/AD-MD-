@@ -5,6 +5,7 @@ import { WorkspacesService } from './workspaces.service.js';
 import { CreateWorkspaceDto } from './dto/create-workspace.dto.js';
 import { UpdateWorkspaceDto } from './dto/update-workspace.dto.js';
 import { AddMemberDto } from './dto/add-member.dto.js';
+import { UpdateMemberProfileDto } from './dto/update-member.dto.js';
 
 @UseGuards(JwtAuthGuard)
 @Controller('workspaces')
@@ -42,6 +43,16 @@ export class WorkspacesController {
     @Body() dto: AddMemberDto,
   ) {
     return this.workspacesService.addMember(user.id, id, dto.email);
+  }
+
+  @Patch(':id/members/:userId')
+  updateMember(
+    @CurrentUser() user: { id: string },
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+    @Body() dto: UpdateMemberProfileDto,
+  ) {
+    return this.workspacesService.updateMemberProfile(user.id, id, userId, dto);
   }
 
   @Get(':id')

@@ -1,4 +1,4 @@
-import { Injectable, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { CreateWorkspaceDto } from './dto/create-workspace.dto.js';
 import { UpdateWorkspaceDto } from './dto/update-workspace.dto.js';
@@ -91,6 +91,81 @@ export class WorkspacesService {
       role: member.role,
       name: member.user.name,
       email: member.user.email,
+    };
+  }
+
+  async updateMemberProfile(
+    actorId: string,
+    workspaceId: string,
+    targetUserId: string,
+    dto: { name?: string; email?: string },
+  ) {
+    const actor = await this.prisma.workspaceMember.findUnique({
+      where: { workspaceId_userId: { workspaceId, userId: actorId } },
+      include: { user: { select: { name: true } } },
+    });
+    if (!actor) throw new ForbiddenException('You are not a member of this workspace');
+    if (actor.role !== 'owner' && actor.role !== 'admin') {
+      throw new ForbiddenException('Only a workspace manager can edit members');
+    }
+
+    const target = await this.prisma.user.findUnique({ where: { id: targetUserId } });
+    if (!target) throw new NotFoundException('User not found');
+    const membership = await this.prisma.workspaceMember.findUnique({
+      where: { workspaceId_userId: { workspaceId, userId: targetUserId } },
+    });
+    const assignedHere = await this.prisma.task.findFirst({
+      where: { assigneeId: targetUserId, list: { space: { workspaceId } } },
+      select: { id: true },
+    });
+    if (!membership && !assignedHere) {
+      throw new ForbiddenException('That user is not in this workspace');
+    }
+
+    const data: { name?: string; email?: string; emailVerified?: boolean; emailVerifiedAt?: Date | null } = {};
+    if (dto.name !== undefined) {
+      const name = dto.name.trim();
+      if (!name) throw new BadRequestException('Name is required');
+      if (name !== target.name) data.name = name;
+    }
+    let emailChanged = false;
+    if (dto.email !== undefined) {
+      const email = dto.email.trim().toLowerCase();
+      const taken = await this.prisma.user.findFirst({ where: { email, NOT: { id: targetUserId } } });
+      if (taken) throw new ConflictException('Email already registered');
+      if (email !== target.email.toLowerCase()) {
+        data.email = email;
+        data.emailVerified = true;
+        data.emailVerifiedAt = new Date();
+        emailChanged = true;
+      }
+    }
+    if (!dto.name && !dto.email) throw new BadRequestException('Nothing to update');
+
+    const updated = Object.keys(data).length
+      ? await this.prisma.user.update({
+          where: { id: targetUserId },
+          data,
+          select: { id: true, name: true, email: true },
+        })
+      : { id: target.id, name: target.name, email: target.email };
+
+    if (emailChanged) {
+      await this.prisma.activityLog.create({
+        data: {
+          workspaceId,
+          userId: actorId,
+          action: `${actor.user.name} updated ${target.name}'s email address`,
+          meta: { targetUserId },
+        },
+      });
+    }
+
+    return {
+      userId: updated.id,
+      name: updated.name,
+      email: updated.email,
+      role: membership?.role ?? null,
     };
   }
 

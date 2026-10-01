@@ -2,6 +2,7 @@ import { Injectable, ConflictException, UnauthorizedException } from '@nestjs/co
 import { JwtService } from '@nestjs/jwt';
 import bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { EmailService } from '../email/email.service.js';
 import { SignupDto } from './dto/signup.dto.js';
 import { LoginDto } from './dto/login.dto.js';
 
@@ -10,6 +11,7 @@ export class AuthService {
   constructor(
     private prisma: PrismaService,
     private jwtService: JwtService,
+    private emails: EmailService,
   ) {}
 
   async signup(dto: SignupDto) {
@@ -28,8 +30,66 @@ export class AuthService {
         name: dto.name,
       },
     });
+    await this.sendVerification(user).catch(() => undefined);
 
     return this.buildAuthResponse(user);
+  }
+
+  async changeEmail(userId: string, email: string) {
+    const next = email.trim().toLowerCase();
+    const taken = await this.prisma.user.findFirst({ where: { email: next, NOT: { id: userId } } });
+    if (taken) throw new ConflictException('Email already registered');
+    const user = await this.prisma.user.update({
+      where: { id: userId },
+      data: { email: next, emailVerified: false, emailVerifiedAt: null },
+    });
+    const result = await this.sendVerification(user).catch(() => ({ ok: false as const, error: 'Email could not be sent.' }));
+    return {
+      ...this.buildAuthResponse(user),
+      emailVerified: false,
+      verificationSent: result.ok,
+    };
+  }
+
+  async me(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, name: true, email: true, emailVerified: true },
+    });
+    if (!user) throw new UnauthorizedException('User not found');
+    return user;
+  }
+
+  async resendVerification(userId: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new UnauthorizedException('User not found');
+    if (user.emailVerified) return { emailVerified: true };
+    const result = await this.sendVerification(user);
+    if (!result.ok) return { sent: false, error: result.error };
+    return { sent: true };
+  }
+
+  async verifyEmail(token: string) {
+    try {
+      const payload = this.jwtService.verify(token) as { sub?: string; email?: string; purpose?: string };
+      if (payload.purpose !== 'verify-email' || !payload.sub || !payload.email) throw new Error('invalid');
+      const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
+      if (!user || user.email !== payload.email) {
+        return '<p>This verification link is no longer valid.</p>';
+      }
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: { emailVerified: true, emailVerifiedAt: new Date() },
+      });
+      return '<p>Your email is verified. You can close this page.</p>';
+    } catch {
+      return '<p>This verification link is no longer valid.</p>';
+    }
+  }
+
+  private async sendVerification(user: { id: string; email: string; name: string }) {
+    const message = this.emails.verificationMessage(user.id, user.email, user.name);
+    return this.emails.sendEmail(message);
   }
 
   async login(dto: LoginDto) {
