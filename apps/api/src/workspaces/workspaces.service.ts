@@ -200,6 +200,7 @@ export class WorkspacesService {
                 OR: [
                   { title: contains },
                   { description: contains },
+                  { code: contains },
                   { assigneeName: contains },
                   { ownerName: contains },
                   { createdBy: { name: contains } },
@@ -284,6 +285,7 @@ export class WorkspacesService {
         const isDone = status?.type === 'done';
         return {
           id: t.id,
+          code: t.code,
           title: t.title,
           status: status?.name || '',
           statusColor: status?.color || '#94a3b8',

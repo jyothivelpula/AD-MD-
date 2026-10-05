@@ -56,4 +56,40 @@ export class CreateTaskDto {
   @IsOptional()
   @IsString()
   parentTaskId?: string;
+
+  @IsOptional()
+  @IsString()
+  taskType?: string;
+
+  @IsOptional()
+  @IsString()
+  team?: string;
+
+  @IsOptional()
+  @IsString()
+  reviewerId?: string;
+
+  @IsOptional()
+  @IsString()
+  estimatedTime?: string;
+
+  @IsOptional()
+  @IsString()
+  actualTime?: string;
+
+  @IsOptional()
+  @IsString()
+  dependencyType?: string;
+
+  @IsOptional()
+  @IsString()
+  dependencyTaskId?: string;
+
+  @IsOptional()
+  @IsString()
+  acceptanceCriteria?: string;
+
+  @IsOptional()
+  @IsString()
+  approvalStatus?: string;
 }

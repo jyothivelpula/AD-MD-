@@ -11,6 +11,22 @@ import { MoveTaskDto } from './dto/move-task.dto.js';
 import { MergeTaskDto } from './dto/merge-task.dto.js';
 import { AddCommentDto } from './dto/add-comment.dto.js';
 
+const TASK_TYPES = ['Development', 'Bug', 'Research', 'Documentation', 'Meeting', 'Testing', 'Design', 'Marketing', 'HR', 'Other'];
+const TEAMS = ['Development', 'AI / ML', 'GenAI', 'HR', 'Marketing', 'Sales', 'Finance', 'Operations', 'Management', 'Other'];
+const DURATIONS = ['30 minutes', '1 hour', '2 hours', '1 day', '3 days'];
+const APPROVAL_STATUSES = ['Not Required', 'Pending', 'Approved', 'Rejected', 'Changes Requested'];
+const DEPENDENCY_TYPES = ['Blocked by', 'Blocks', 'Related to'];
+
+function optionalChoice(value: string | undefined, allowed: string[], label: string) {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!allowed.includes(trimmed)) {
+    throw new BadRequestException(`${label} is not a valid option`);
+  }
+  return trimmed;
+}
+
 function parseDate(value?: string): Date | null | undefined {
   if (value === undefined) return undefined;
   if (!value) return null;
@@ -25,6 +41,77 @@ export class TasksService {
     private notifications: NotificationsService,
     private emails: EmailService,
   ) {}
+
+  private async allocateTaskCode() {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const rows = await this.prisma.$queryRaw<{ code: string }[]>`
+        SELECT code FROM "Task"
+        WHERE code LIKE 'TASK-%'
+        ORDER BY CAST(SUBSTRING(code FROM 6) AS INTEGER) DESC
+        LIMIT 1
+      `;
+      const current = rows[0] ? Number(rows[0].code.slice(5)) : 0;
+      const code = `TASK-${String((Number.isFinite(current) ? current : 0) + 1).padStart(4, '0')}`;
+      const taken = await this.prisma.task.findUnique({ where: { code }, select: { id: true } });
+      if (!taken) return code;
+    }
+    throw new BadRequestException('Could not assign a task ID');
+  }
+
+  private async dependencyPatch(taskId: string, workspaceId: string, dto: { dependencyTaskId?: string | null; dependencyType?: string | null }) {
+    if (dto.dependencyTaskId === undefined && dto.dependencyType === undefined) return {};
+    const dependencyTaskId = (dto.dependencyTaskId ?? '').trim();
+    const dependencyType = optionalChoice(dto.dependencyType ?? undefined, DEPENDENCY_TYPES, 'Dependency type');
+    if (dependencyTaskId === '') {
+      return { dependencyTaskId: null, dependencyType: null };
+    }
+    if (!dependencyTaskId && dependencyType === undefined) return {};
+    if (!dependencyTaskId) {
+      throw new BadRequestException('Choose a related task for this dependency');
+    }
+    if (dependencyTaskId === taskId) {
+      throw new BadRequestException('A task cannot depend on itself');
+    }
+    const other = await this.prisma.task.findUnique({
+      where: { id: dependencyTaskId },
+      include: { list: { select: { space: { select: { workspaceId: true } } } } },
+    });
+    if (!other || other.list.space.workspaceId !== workspaceId) {
+      throw new BadRequestException('Related task was not found in this workspace');
+    }
+    return {
+      dependencyTaskId,
+      dependencyType: dependencyType || 'Related to',
+    };
+  }
+
+  private async resolveReviewer(workspaceId: string, reviewerId: string | null) {
+    const id = (reviewerId || '').trim();
+    if (!id) return null;
+    const member = await this.prisma.workspaceMember.findUnique({
+      where: { workspaceId_userId: { workspaceId, userId: id } },
+    });
+    if (!member) throw new BadRequestException('Reviewer must be a workspace member');
+    return id;
+  }
+
+  private choicePatch(dto: {
+    taskType?: string;
+    team?: string;
+    estimatedTime?: string;
+    actualTime?: string;
+    acceptanceCriteria?: string;
+    approvalStatus?: string;
+  }) {
+    return {
+      ...(dto.taskType !== undefined ? { taskType: optionalChoice(dto.taskType, TASK_TYPES, 'Task type') } : {}),
+      ...(dto.team !== undefined ? { team: optionalChoice(dto.team, TEAMS, 'Team') } : {}),
+      ...(dto.estimatedTime !== undefined ? { estimatedTime: optionalChoice(dto.estimatedTime, DURATIONS, 'Estimated time') } : {}),
+      ...(dto.actualTime !== undefined ? { actualTime: optionalChoice(dto.actualTime, DURATIONS, 'Actual time') } : {}),
+      ...(dto.approvalStatus !== undefined ? { approvalStatus: optionalChoice(dto.approvalStatus, APPROVAL_STATUSES, 'Approval status') || 'Not Required' } : {}),
+      ...(dto.acceptanceCriteria !== undefined ? { acceptanceCriteria: (dto.acceptanceCriteria || '').trim() || null } : {}),
+    };
+  }
 
   private async assertListAccess(userId: string, listId: string) {
     const list = await this.prisma.list.findUnique({
@@ -221,6 +308,10 @@ export class TasksService {
     });
     const position = lastTask ? lastTask.position + 1 : 1;
     const assignee = await this.resolveAssignee(dto.assigneeId, dto.assigneeName);
+    const workspaceId = list.space.workspaceId;
+    const code = await this.allocateTaskCode();
+    const reviewerId = dto.reviewerId !== undefined ? await this.resolveReviewer(workspaceId, dto.reviewerId) : undefined;
+    const dependency = await this.dependencyPatch('new', workspaceId, dto);
 
     const task = await this.prisma.task.create({
       data: {
@@ -237,10 +328,14 @@ export class TasksService {
         workCategory: dto.workCategory,
         scope: dto.scope,
         url: dto.url,
+        code,
         startDate: parseDate(dto.startDate) || undefined,
         dueDate: parseDate(dto.dueDate) || undefined,
         progressDate: parseDate(dto.progressDate) || undefined,
         parentTaskId: dto.parentTaskId,
+        ...(reviewerId !== undefined ? { reviewerId } : {}),
+        ...this.choicePatch(dto),
+        ...dependency,
       },
     });
     await this.syncTaskAssignees(task.id, assignee.assigneeId);
@@ -288,7 +383,11 @@ export class TasksService {
 
   async findOne(userId: string, taskId: string) {
     const task = await this.assertTaskAccess(userId, taskId);
-    const [subtasks, nextActions, comments, attachments, activityLogs, assignee] = await Promise.all([
+    if (!task.code) {
+      task.code = await this.allocateTaskCode();
+      await this.prisma.task.update({ where: { id: task.id }, data: { code: task.code } });
+    }
+    const [subtasks, nextActions, comments, attachments, activityLogs, assignee, dependencyTask, reviewer] = await Promise.all([
       this.prisma.task.findMany({ where: { parentTaskId: taskId }, orderBy: { position: 'asc' } }),
       this.prisma.nextActionEntry.findMany({ where: { taskId }, orderBy: { createdAt: 'desc' } }),
       this.prisma.comment.findMany({ where: { taskId }, orderBy: { createdAt: 'asc' } }),
@@ -296,6 +395,12 @@ export class TasksService {
       this.prisma.activityLog.findMany({ where: { taskId }, orderBy: { createdAt: 'desc' }, take: 20 }),
       task.assigneeId
         ? this.prisma.user.findUnique({ where: { id: task.assigneeId }, select: { email: true, emailVerified: true } })
+        : Promise.resolve(null),
+      task.dependencyTaskId
+        ? this.prisma.task.findUnique({ where: { id: task.dependencyTaskId }, select: { id: true, title: true, code: true } })
+        : Promise.resolve(null),
+      task.reviewerId
+        ? this.prisma.user.findUnique({ where: { id: task.reviewerId }, select: { id: true, name: true, email: true } })
         : Promise.resolve(null),
     ]);
     return {
@@ -305,6 +410,9 @@ export class TasksService {
       comments,
       attachments,
       activityLogs,
+      dependencyTask,
+      reviewerName: reviewer?.name || null,
+      reviewerEmail: reviewer?.email || null,
       assigneeEmail: assignee?.emailVerified ? assignee.email : null,
       assigneeEmailUnverified: assignee && !assignee.emailVerified ? assignee.email : null,
       customFieldDefs: task.list.space.customFields,
@@ -326,6 +434,10 @@ export class TasksService {
         ? await this.resolveAssignee(dto.assigneeId, dto.assigneeName)
         : null;
 
+    const workspaceId = task.list.space.workspaceId;
+    const reviewerId = dto.reviewerId !== undefined ? await this.resolveReviewer(workspaceId, dto.reviewerId) : undefined;
+    const dependency = await this.dependencyPatch(taskId, workspaceId, dto);
+
     const updated = await this.prisma.task.update({
       where: { id: taskId },
       data: {
@@ -344,9 +456,11 @@ export class TasksService {
         ...(dto.dueDate !== undefined ? { dueDate: parseDate(dto.dueDate) } : {}),
         ...(dto.progressDate !== undefined ? { progressDate: parseDate(dto.progressDate) } : {}),
         ...(dto.customFieldValues !== undefined ? { customFields: dto.customFieldValues } : {}),
+        ...(reviewerId !== undefined ? { reviewerId } : {}),
+        ...this.choicePatch(dto),
+        ...dependency,
       },
     });
-    const workspaceId = task.list.space.workspaceId;
     const activityTask = {
       id: updated.id,
       title: updated.title,
@@ -489,6 +603,16 @@ export class TasksService {
         workCategory: task.workCategory,
         scope: task.scope,
         url: task.url,
+        code: await this.allocateTaskCode(),
+        taskType: task.taskType,
+        team: task.team,
+        reviewerId: task.reviewerId,
+        estimatedTime: task.estimatedTime,
+        actualTime: task.actualTime,
+        dependencyType: task.dependencyType,
+        dependencyTaskId: task.dependencyTaskId,
+        acceptanceCriteria: task.acceptanceCriteria,
+        approvalStatus: task.approvalStatus,
         startDate: task.startDate,
         dueDate: task.dueDate,
         progressDate: task.progressDate,

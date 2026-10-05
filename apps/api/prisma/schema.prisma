@@ -32,6 +32,7 @@ model User {
   memberships        WorkspaceMember[]
   assignedTasks      Task[]            @relation("TaskAssigneeUser")
   createdTasks       Task[]            @relation("TaskCreatedBy")
+  reviewedTasks      Task[]            @relation("TaskReviewer")
   taskAssigneeLinks  TaskAssignee[]
   aiChats            AiChat[]
   notifications           Notification[]
@@ -106,6 +107,19 @@ model Task {
   workCategory String?
   scope        String?
   url          String?
+  code         String?   @unique
+  taskType     String?
+  team         String?
+  reviewerId   String?
+  reviewer     User?     @relation("TaskReviewer", fields: [reviewerId], references: [id], onDelete: SetNull)
+  estimatedTime String?
+  actualTime   String?
+  dependencyType String?
+  dependencyTaskId String?
+  dependencyTask   Task?  @relation("TaskDependency", fields: [dependencyTaskId], references: [id], onDelete: SetNull)
+  dependents       Task[] @relation("TaskDependency")
+  acceptanceCriteria String?
+  approvalStatus String @default("Not Required")
   createdAt    DateTime  @default(now())
 
   assignees    TaskAssignee[]

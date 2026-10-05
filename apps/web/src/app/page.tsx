@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { apiFetch, API_URL } from '@/lib/api';
 import AiChatPanel from '@/components/ai/AiChatPanel';
 import NotificationBell from '@/components/notifications/NotificationBell';
+import { timeAgo, type NotificationItem } from '@/components/notifications/shared';
 import NotificationCenter from '@/components/notifications/NotificationCenter';
 import NotificationSettings from '@/components/notifications/NotificationSettings';
 import AiIcon from '@/components/ai/AiIcon';
@@ -23,6 +24,7 @@ type Comment = { id: string; body: string; authorName?: string | null; createdAt
 type Attachment = { id: string; url: string; name: string };
 type Task = {
   id: string;
+  listId?: string;
   title: string;
   description?: string | null;
   statusId: string;
@@ -35,6 +37,16 @@ type Task = {
   workCategory?: string | null;
   scope?: string | null;
   url?: string | null;
+  code?: string | null;
+  taskType?: string | null;
+  team?: string | null;
+  reviewerId?: string | null;
+  estimatedTime?: string | null;
+  actualTime?: string | null;
+  dependencyType?: string | null;
+  dependencyTaskId?: string | null;
+  acceptanceCriteria?: string | null;
+  approvalStatus?: string | null;
   startDate?: string | null;
   dueDate?: string | null;
   progressDate?: string | null;
@@ -50,6 +62,8 @@ type TaskDetail = Task & {
   activityLogs?: { id: string; action: string; createdAt: string }[];
   assigneeEmail?: string | null;
   assigneeEmailUnverified?: string | null;
+  reviewerName?: string | null;
+  dependencyTask?: { id: string; title: string; code?: string | null } | null;
   customFieldDefs: CustomField[];
 };
 
@@ -93,6 +107,11 @@ const FONT_OPTIONS: { label: string; value: string }[] = [
 const WORK_CATEGORY_OPTIONS = ['Development', 'Design', 'Research', 'Marketing', 'Sales', 'Operations', 'Documentation', 'Promotion'];
 const SCOPE_OPTIONS = ['Small Task', 'Medium Task', 'Large Task', 'Epic'];
 const PRIORITY_OPTIONS = ['Urgent', 'High', 'Normal', 'Low'];
+const TASK_TYPE_OPTIONS = ['Development', 'Bug', 'Research', 'Documentation', 'Meeting', 'Testing', 'Design', 'Marketing', 'HR', 'Other'];
+const TEAM_OPTIONS = ['Development', 'AI / ML', 'GenAI', 'HR', 'Marketing', 'Sales', 'Finance', 'Operations', 'Management', 'Other'];
+const DURATION_OPTIONS = ['30 minutes', '1 hour', '2 hours', '1 day', '3 days'];
+const APPROVAL_OPTIONS = ['Not Required', 'Pending', 'Approved', 'Rejected', 'Changes Requested'];
+const DEPENDENCY_OPTIONS = ['Blocked by', 'Blocks', 'Related to'];
 const CUSTOM_FIELD_TYPES = ['text', 'number', 'date', 'dropdown', 'checkbox'];
 
 const DEFAULT_THEME: Theme = {
@@ -184,6 +203,68 @@ function priorityColor(p?: string | null): string {
     default:
       return 'text-gray-300';
   }
+}
+
+function statusTone(status?: { name?: string; type?: string }) {
+  const name = (status?.name || '').toLowerCase();
+  if (name.includes('block')) return { bg: 'bg-red-50', text: 'text-red-700', dot: 'bg-red-600', bar: 'bg-red-500' };
+  if (status?.type === 'done' || name === 'done') return { bg: 'bg-green-50', text: 'text-green-700', dot: 'bg-green-600', bar: 'bg-green-500' };
+  if (status?.type === 'in_progress' || name.includes('progress')) return { bg: 'bg-blue-50', text: 'text-blue-700', dot: 'bg-blue-600', bar: 'bg-blue-500' };
+  if (name.includes('poc')) return { bg: 'bg-violet-50', text: 'text-violet-700', dot: 'bg-violet-500', bar: 'bg-violet-500' };
+  return { bg: 'bg-gray-100', text: 'text-gray-700', dot: 'bg-gray-400', bar: 'bg-gray-400' };
+}
+
+function progressFromStatus(status?: { name?: string; type?: string }) {
+  const name = (status?.name || '').toLowerCase();
+  if (name.includes('block')) return 15;
+  if (status?.type === 'done' || name === 'done') return 100;
+  if (status?.type === 'in_progress' || name.includes('progress')) return 55;
+  if (name.includes('poc')) return 35;
+  return 8;
+}
+
+function personInitials(name?: string | null) {
+  if (!name?.trim()) return '—';
+  return name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase() || '').join('');
+}
+
+function shortDate(value?: string | null) {
+  if (!value) return 'No date';
+  const date = new Date(`${value.slice(0, 10)}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return 'No date';
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function criterionChecked(line: string) {
+  return /^\s*(\[[xX]\]|☑)/.test(line);
+}
+
+function criterionBody(line: string) {
+  return line.replace(/^\s*(\[[ xX]\]|☑|□)\s*/, '');
+}
+
+function toggleCriterion(text: string, index: number) {
+  const lines = text.split('\n');
+  const current = lines[index] || '';
+  const body = criterionBody(current);
+  lines[index] = criterionChecked(current) ? body : `[x] ${body}`;
+  return lines.join('\n');
+}
+
+function groupDailyLogs(entries: { id: string; text: string; createdAt: string }[]) {
+  const sorted = [...entries].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  const groups: { key: string; label: string; items: typeof sorted }[] = [];
+  for (const entry of sorted) {
+    const date = new Date(entry.createdAt);
+    const key = date.toDateString();
+    const label = key === new Date().toDateString()
+      ? 'Today'
+      : date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    const group = groups.find((item) => item.key === key);
+    if (group) group.items.push(entry);
+    else groups.push({ key, label, items: [entry] });
+  }
+  return groups.reverse();
 }
 
 // Comments (and any other dated entry) automatically shift background color as they age.
@@ -436,15 +517,32 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
     startDate: string;
     dueDate: string;
     progressDate: string;
+    taskType: string;
+    team: string;
+    reviewerId: string;
+    estimatedTime: string;
+    actualTime: string;
+    dependencyType: string;
+    dependencyTaskId: string;
+    dependencyLabel: string;
+    acceptanceCriteria: string;
+    approvalStatus: string;
   } | null>(null);
   const [customFieldValues, setCustomFieldValues] = useState<Record<string, string>>({});
   const [newSubtaskTitle, setNewSubtaskTitle] = useState('');
   const [handOffTo, setHandOffTo] = useState('');
   const [detailSaving, setDetailSaving] = useState(false);
+  const [taskSavedNotice, setTaskSavedNotice] = useState('');
+  const [criterionDraft, setCriterionDraft] = useState('');
+  const taskFileInput = useRef<HTMLInputElement | null>(null);
   const [nextActionText, setNextActionText] = useState('');
   const [editingNextActionId, setEditingNextActionId] = useState<string | null>(null);
   const [editingNextActionText, setEditingNextActionText] = useState('');
   const [showAllLogs, setShowAllLogs] = useState(false);
+  const [reviewerFilter, setReviewerFilter] = useState('');
+  const [peopleQuery, setPeopleQuery] = useState('');
+  const [dependencyQuery, setDependencyQuery] = useState('');
+  const [dependencyHits, setDependencyHits] = useState<{ id: string; title: string; code?: string | null; spaceName?: string }[]>([]);
   const [hiddenFields, setHiddenFields] = useState<Set<string>>(new Set());
   const [customizeFieldsOpen, setCustomizeFieldsOpen] = useState(false);
   const [hiddenCustomFieldIds, setHiddenCustomFieldIds] = useState<Set<string>>(new Set());
@@ -454,6 +552,12 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
     setHiddenFields(new Set(loadHiddenFields()));
     setHiddenCustomFieldIds(new Set(loadHiddenCustomFields()));
   }, []);
+
+  useEffect(() => {
+    if (!taskSavedNotice) return;
+    const timer = window.setTimeout(() => setTaskSavedNotice(''), 2400);
+    return () => window.clearTimeout(timer);
+  }, [taskSavedNotice]);
 
   function toggleFieldVisibility(key: string) {
     setHiddenFields((prev) => {
@@ -502,6 +606,7 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
 
   // "Where I left off" — see LastView/RecentTaskEntry types above.
   const [recentTasks, setRecentTasks] = useState<RecentTaskEntry[]>([]);
+  const [homeActivity, setHomeActivity] = useState<NotificationItem[]>([]);
   const restoreAttempted = useRef(false);
   const [listViewMode, setListViewMode] = useState<'list' | 'board'>('list');
   const [listGroupBy, setListGroupBy] = useState<'status' | 'assignee' | 'priority'>('status');
@@ -1006,6 +1111,37 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
       }
     })();
   }, [spaces, selectedWorkspace]);
+
+  useEffect(() => {
+    if (!selectedWorkspace || spaces.length === 0) return;
+    if (detailTask || viewingList || aiOpen || centerView) return;
+    let cancelled = false;
+    (async () => {
+      for (const space of spaces) {
+        let lists = listsBySpace[space.id];
+        if (!lists) {
+          try {
+            lists = (await loadSpaceListsAndPeople(space)).data;
+          } catch {
+            continue;
+          }
+        }
+        if (cancelled || !lists) continue;
+        await Promise.all(lists.filter((list) => !isPersonView(list)).map((list) => refreshListTasks(list.id)));
+      }
+      try {
+        const data: { notifications?: NotificationItem[] } = await apiFetch(
+          `/notifications?workspaceId=${encodeURIComponent(selectedWorkspace.id)}&page=1&limit=6&filter=all`,
+        );
+        if (!cancelled) setHomeActivity(data.notifications || []);
+      } catch {
+        if (!cancelled) setHomeActivity([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedWorkspace?.id, spaces.map((space) => space.id).join(','), !!detailTask, viewingList?.list.id, aiOpen, centerView]);
 
   function applyTheme(next: Theme) {
     setTheme(next);
@@ -1749,7 +1885,24 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
         startDate: toDateInput(data.startDate),
         dueDate: toDateInput(data.dueDate),
         progressDate: toDateInput(data.progressDate),
+        taskType: data.taskType || '',
+        team: data.team || '',
+        reviewerId: data.reviewerId || '',
+        estimatedTime: data.estimatedTime || '',
+        actualTime: data.actualTime || '',
+        dependencyType: data.dependencyType || '',
+        dependencyTaskId: data.dependencyTaskId || '',
+        dependencyLabel: data.dependencyTask
+          ? `${data.dependencyTask.code ? `${data.dependencyTask.code} · ` : ''}${data.dependencyTask.title}`
+          : '',
+        acceptanceCriteria: data.acceptanceCriteria || '',
+        approvalStatus: data.approvalStatus || 'Not Required',
       });
+      setReviewerFilter('');
+      setPeopleQuery('');
+      setDependencyQuery('');
+      setDependencyHits([]);
+      setCriterionDraft('');
       setCustomFieldValues(
         data.customFields && typeof data.customFields === 'object' ? { ...data.customFields } : {},
       );
@@ -1888,6 +2041,8 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
     setApproverName('');
     setApproverDateTime('');
     setShowAllLogs(false);
+    setCriterionDraft('');
+    setPeopleQuery('');
   }
 
   async function saveTaskDetail() {
@@ -1913,12 +2068,22 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
           startDate: detailForm.startDate || null,
           dueDate: detailForm.dueDate || null,
           progressDate: detailForm.progressDate || null,
+          taskType: detailForm.taskType || null,
+          team: detailForm.team || null,
+          reviewerId: detailForm.reviewerId || null,
+          estimatedTime: detailForm.estimatedTime || null,
+          actualTime: detailForm.actualTime || null,
+          dependencyType: detailForm.dependencyTaskId ? detailForm.dependencyType || 'Related to' : null,
+          dependencyTaskId: detailForm.dependencyTaskId || null,
+          acceptanceCriteria: detailForm.acceptanceCriteria || null,
+          approvalStatus: detailForm.approvalStatus || 'Not Required',
           customFieldValues,
         }),
       });
       const listId = detailListId;
       const space = detailSpace;
       closeTaskDetail();
+      setTaskSavedNotice('Task saved');
       if (space) {
         const list = (listsBySpace[space.id] || []).find((l) => l.id === listId) || {
           id: listId,
@@ -2913,6 +3078,11 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
           </header>
         )}
         <div className={`flex-1 min-h-0 relative ${aiOpen ? 'overflow-hidden' : 'overflow-y-auto'}`} onClick={() => aiMenuFor && setAiMenuFor(null)}>
+        {taskSavedNotice && (
+          <div className="sticky top-3 z-30 mx-auto mb-2 w-fit rounded-full border border-green-200 bg-white px-3 py-1.5 text-sm text-green-700 shadow-sm">
+            {taskSavedNotice}
+          </div>
+        )}
         {aiOpen && selectedWorkspace ? (
           <AiChatPanel
             workspaceId={selectedWorkspace.id}
@@ -2964,35 +3134,58 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
           const hasAnything = overdueTasksList.length > 0 || myRecent.length > 0;
           const hour = new Date().getHours();
           const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+          const todayLabel = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+          const firstName = user?.name?.split(' ')[0] || 'there';
           return (
-            <div className="p-8 max-w-2xl">
-              <h2 className="text-xl font-semibold mb-1">
-                {greeting}, {user?.name?.split(' ')[0] || 'there'} 👋
-              </h2>
-              <p className="text-sm opacity-60 mb-6">Here's where you left off.</p>
-
-              {overdueTasksList.length > 0 && (
-                <div className="mb-6">
-                  <h3 className="text-sm font-semibold mb-2 text-red-600">⚠ Overdue ({overdueTasksList.length})</h3>
-                  <div className="space-y-1">
-                    {overdueTasksList.slice(0, 8).map(({ list, space, task }) => (
-                      <button
-                        key={task.id}
-                        onClick={() => openTaskDetail(list, space, task.id, task)}
-                        className="w-full text-left bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg px-3 py-2 text-sm flex items-center justify-between gap-3"
-                      >
-                        <span className="truncate">{task.title}</span>
-                        <span className="text-xs opacity-60 shrink-0">{space.name}{list.name ? ` / ${list.name}` : ''}</span>
-                      </button>
-                    ))}
+            <div className="min-h-full bg-[#f4f5f7] px-5 py-8 sm:px-8">
+              <div className="mx-auto max-w-5xl">
+                <div className="flex flex-wrap items-end justify-between gap-4">
+                  <div>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-400">{todayLabel}</p>
+                    <h2 className="mt-1 text-[28px] font-semibold tracking-tight text-gray-900">{greeting}, {firstName}</h2>
+                    <p className="mt-1 text-sm text-gray-500">Continue a task, or open a space to see the work in progress.</p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button type="button" onClick={() => setSearchOpen(true)} className="rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm hover:bg-gray-50">Search</button>
+                    <button type="button" onClick={() => openAiWorkspace()} className="rounded-lg px-3 py-2 text-sm font-medium text-white shadow-sm" style={{ backgroundColor: theme.accent }}>Ask AI</button>
                   </div>
                 </div>
-              )}
 
-              {myRecent.length > 0 && (
-                <div className="mb-6">
-                  <h3 className="text-sm font-semibold mb-2 opacity-70">🕓 Recently viewed</h3>
-                  <div className="space-y-1">
+                <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                  {[
+                    ['Spaces', String(spaces.length)],
+                    ['Recent', String(myRecent.length)],
+                    ['Overdue', String(overdueTasksList.length)],
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-xl border border-gray-200 bg-white px-4 py-3 shadow-sm">
+                      <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">{label}</p>
+                      <p className={`mt-1 text-2xl font-semibold ${label === 'Overdue' && overdueTasksList.length > 0 ? 'text-red-600' : 'text-gray-900'}`}>{value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                {overdueTasksList.length > 0 && (
+                  <section className="mt-6 rounded-xl border border-red-100 bg-white p-4 shadow-sm">
+                    <h3 className="text-sm font-semibold text-red-700">Overdue · {overdueTasksList.length}</h3>
+                    <div className="mt-3 divide-y divide-gray-100">
+                      {overdueTasksList.slice(0, 8).map(({ list, space, task }) => (
+                        <button
+                          key={task.id}
+                          onClick={() => openTaskDetail(list, space, task.id, task)}
+                          className="flex w-full items-center justify-between gap-3 py-2.5 text-left text-sm hover:bg-red-50/60"
+                        >
+                          <span className="truncate font-medium text-gray-800">{task.title}</span>
+                          <span className="shrink-0 text-xs text-gray-400">{space.name}{list.name ? ` / ${list.name}` : ''}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </section>
+                )}
+
+                <section className="mt-6 rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+                  <h3 className="text-sm font-semibold text-gray-800">Recently viewed</h3>
+                  {myRecent.length === 0 && <p className="mt-3 text-sm text-gray-400">Tasks you open will show up here.</p>}
+                  <div className="mt-2 divide-y divide-gray-100">
                     {myRecent.slice(0, 6).map((r) => (
                       <button
                         key={r.taskId}
@@ -3006,22 +3199,56 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
                           };
                           openTaskDetail(list, sp, r.taskId);
                         }}
-                        className="w-full text-left bg-gray-50 hover:bg-gray-100 border rounded-lg px-3 py-2 text-sm flex items-center justify-between gap-3"
+                        className="flex w-full items-center justify-between gap-3 rounded-lg px-1 py-2.5 text-left hover:bg-gray-50"
                       >
-                        <span className="truncate">{r.taskTitle}</span>
-                        <span className="text-xs opacity-60 shrink-0">{r.spaceName} / {r.listName}</span>
+                        <span className="min-w-0">
+                          <span className="block truncate text-sm font-medium text-gray-800">{r.taskTitle}</span>
+                          <span className="mt-0.5 block text-xs text-gray-400">{r.spaceName}</span>
+                        </span>
+                        <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[11px] text-gray-500">{r.listName}</span>
                       </button>
                     ))}
                   </div>
-                </div>
-              )}
+                </section>
 
-              {!hasAnything && (
-                <div className="text-gray-400 mt-8">
-                  Select a task from the sidebar to view its details, click "View" next to a List for the
-                  List/Board view, or create a Space and List to get started.
-                </div>
-              )}
+                {spaces.length > 0 && (
+                  <section className="mt-6">
+                    <h3 className="text-sm font-semibold text-gray-800">Spaces</h3>
+                    <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      {spaces.map((space) => {
+                        const lists = (listsBySpace[space.id] || []).filter((list) => !isPersonView(list));
+                        return (
+                          <div key={space.id} className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm transition-shadow hover:shadow-md">
+                            <div className="flex items-center justify-between gap-2">
+                              <p className="truncate text-sm font-semibold text-gray-900">{space.name}</p>
+                              <span className="text-[11px] text-gray-400">{lists.length} list{lists.length === 1 ? '' : 's'}</span>
+                            </div>
+                            <div className="mt-3 flex flex-wrap gap-1.5">
+                              {lists.length === 0 && <p className="text-xs text-gray-400">No lists yet. Add one from the sidebar.</p>}
+                              {lists.slice(0, 6).map((list) => (
+                                <button
+                                  key={list.id}
+                                  type="button"
+                                  onClick={() => openListView(list, space)}
+                                  className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-700 hover:border-gray-300 hover:bg-white"
+                                >
+                                  {list.name}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
+
+                {!hasAnything && spaces.length === 0 && (
+                  <p className="mt-8 text-sm text-gray-400">
+                    Select a task from the sidebar, open a list, or create a space to get started.
+                  </p>
+                )}
+              </div>
             </div>
           );
         })()}
@@ -3339,824 +3566,506 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
           );
         })()}
 
-        {detailTask && detailForm && detailSpace && (
-          <div className="max-w-3xl mx-auto p-6">
-            <div className="flex items-center justify-between mb-4">
-              <button onClick={closeTaskDetail} className="text-gray-500 hover:text-gray-800 text-sm">
-                ← Back
-              </button>
-              <div className="flex gap-3 text-xs">
-                <button
-                  onClick={() =>
-                    openAiWorkspace({
-                      newChat: true,
-                      context: {
-                        type: 'task',
-                        id: detailTask.id,
-                        name: detailTask.title,
-                        spaceId: detailSpace.id,
-                        listId: detailListId || undefined,
-                      },
-                    })
-                  }
-                  className="text-gray-400 hover:opacity-100"
-                  onMouseEnter={(e) => (e.currentTarget.style.color = theme.accent)}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = '')}
-                >
-                  ✨ Ask AI
-                </button>
-                <button
-                  onClick={() => {
-                    const p = detailAsListTaskPair();
-                    if (p) duplicateTask(p.list, p.task, detailSpace);
-                  }}
-                  className="text-gray-400 hover:opacity-100"
-                  style={{ color: undefined }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = theme.accent)}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = '')}
-                >
-                  ⧉ Duplicate
-                </button>
-                <button
-                  onClick={() => {
-                    const p = detailAsListTaskPair();
-                    if (p) openMoveDialog(p.list, p.task);
-                  }}
-                  className="text-gray-400"
-                  onMouseEnter={(e) => (e.currentTarget.style.color = theme.accent)}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = '')}
-                >
-                  ⇄ Move
-                </button>
-                <button
-                  onClick={() => {
-                    const p = detailAsListTaskPair();
-                    if (p) openMergeDialog(p.list, p.task);
-                  }}
-                  className="text-gray-400"
-                  onMouseEnter={(e) => (e.currentTarget.style.color = theme.accent)}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = '')}
-                >
-                  ⚭ Merge
-                </button>
-                <button
-                  onClick={openEmailComposer}
-                  className="text-gray-400"
-                  onMouseEnter={(e) => (e.currentTarget.style.color = theme.accent)}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = '')}
-                >
-                  ✉ Email
-                </button>
-                <button
-                  onClick={() => detailListId && deleteTaskFromList({ id: detailListId, name: '', spaceId: detailSpace.id }, detailTask, detailSpace)}
-                  className="text-gray-400 hover:text-red-600"
-                >
-                  🗑 Delete
-                </button>
-                <div className="relative">
-                  <button
-                    onClick={() => setCustomizeFieldsOpen((v) => !v)}
-                    className="text-gray-400 hover:opacity-100"
-                    onMouseEnter={(e) => (e.currentTarget.style.color = theme.accent)}
-                    onMouseLeave={(e) => (e.currentTarget.style.color = '')}
-                  >
-                    ⚙ Customize fields
-                  </button>
-                  {customizeFieldsOpen && (
-                    <div className="absolute right-0 top-5 z-30 bg-white border rounded-lg shadow-xl p-3 w-72 text-left text-black space-y-1.5">
-                      <p className="text-xs font-semibold text-gray-500 mb-1">
-                        Show/hide sections on this task page
-                      </p>
-                      {FIELD_TOGGLES.map((f) => (
-                        <label key={f.key} className="flex items-center gap-2 text-xs">
-                          <input
-                            type="checkbox"
-                            checked={!hiddenFields.has(f.key)}
-                            onChange={() => toggleFieldVisibility(f.key)}
-                          />
-                          {f.label}
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {emailSentNotice && (
-              <p className="mb-3 rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">
-                {emailSentNotice}
-              </p>
-            )}
-
-            <input
-              className="text-2xl font-bold w-full border-none outline-none mb-4"
-              value={detailForm.title}
-              onChange={(e) => setDetailForm({ ...detailForm, title: e.target.value })}
-            />
-
-            <div className="space-y-4">
-              {!hiddenFields.has('description') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
-                {/* Daily log — what used to be the separate "Next Action" card, now here, shown
-                    first per request. Each entry is saved permanently (never auto-deleted),
-                    can be edited in place, and entries from the same calendar day share a color. */}
-                <label className="text-xs font-semibold text-gray-500">🗒 Daily Log</label>
-                <div className="mt-1">
-                  <textarea
-                    className="w-full border rounded-lg px-2 py-1.5 text-sm resize-y"
-                    rows={3}
-                    placeholder="What happened today on this task? (write as much as you need — this box expands)"
-                    value={nextActionText}
-                    onChange={(e) => setNextActionText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addNextAction();
-                    }}
+        {detailTask && detailForm && detailSpace && (() => {
+          const card = 'bg-white rounded-xl border border-gray-200 shadow-sm p-4 transition-shadow hover:shadow-md';
+          const field = 'w-full border border-gray-200 rounded-lg px-2.5 py-1.5 mt-1 text-sm bg-white';
+          const currentStatus = detailSpace.statuses.find((item) => item.id === detailForm.statusId);
+          const tone = statusTone(currentStatus);
+          const progress = progressFromStatus(currentStatus);
+          const people = peopleForSpace(detailSpace.id).filter((person) => person.userId);
+          const reviewer = people.find((person) => person.userId === detailForm.reviewerId);
+          const assignee = people.find((person) => person.userId === detailForm.assigneeId);
+          const criteria = detailForm.acceptanceCriteria.split('\n').filter((line) => criterionBody(line).trim());
+          const orderedLogs = [...detailTask.nextActions].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          const logs = groupDailyLogs(showAllLogs ? orderedLogs : orderedLogs.slice(0, 5));
+          const peopleQueryText = peopleQuery.trim().toLowerCase();
+          const matchingPeople = peopleForSpace(detailSpace.id).filter((person) => !peopleQueryText || `${person.name} ${person.email || ''}`.toLowerCase().includes(peopleQueryText) || person.name === detailForm.ownerName || person.userId === detailForm.assigneeId);
+          const parentTask = detailTask.parentTaskId
+            ? Object.values(tasksByList).flat().find((task) => task.id === detailTask.parentTaskId)
+            : null;
+          return (
+          <div className="min-h-full overflow-x-hidden bg-[#f6f7f9]">
+            <header className="sticky top-0 z-20 border-b border-gray-200 bg-white/95 backdrop-blur px-4 py-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <button onClick={closeTaskDetail} className="text-xs text-gray-500 hover:text-gray-800">← Back</button>
+                  <p className="mt-1 text-[11px] font-medium tracking-wide text-gray-400">{detailTask.code || 'TASK'}</p>
+                  <input
+                    className="w-full border-none bg-transparent text-2xl font-semibold text-gray-900 outline-none"
+                    value={detailForm.title}
+                    onChange={(e) => setDetailForm({ ...detailForm, title: e.target.value })}
                   />
-                  <div className="flex justify-end mt-1">
-                    <button
-                      onClick={addNextAction}
-                      disabled={!nextActionText.trim()}
-                      className="text-white text-sm px-3 py-1.5 rounded-lg disabled:opacity-40"
-                      style={{ backgroundColor: theme.accent }}
-                    >
-                      Log
-                    </button>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium ${tone.bg} ${tone.text}`}>
+                      <span className={`h-1.5 w-1.5 rounded-full ${tone.dot}`} />
+                      {currentStatus?.name || 'No status'}
+                    </span>
+                    {detailForm.priority && (
+                      <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">{detailForm.priority} priority</span>
+                    )}
                   </div>
                 </div>
-                <div className="mt-3 space-y-1.5 max-h-72 overflow-y-auto pr-1">
-                  {detailTask.nextActions.length === 0 && (
-                    <p className="text-xs text-gray-400">No entries logged yet.</p>
-                  )}
-                  {[...detailTask.nextActions]
-                    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-                    .slice(0, showAllLogs ? undefined : 5)
-                    .map((na) => (
-                      <div
-                        key={na.id}
-                        className={`rounded-lg border px-2.5 py-1.5 ${dayColorClass(na.createdAt, detailTask.nextActions.map((x) => x.createdAt))}`}
-                      >
-                        {editingNextActionId === na.id ? (
-                          <div className="space-y-1">
-                            <textarea
-                              autoFocus
-                              className="w-full border rounded-lg px-2 py-1 text-sm bg-white"
-                              rows={2}
-                              value={editingNextActionText}
-                              onChange={(e) => setEditingNextActionText(e.target.value)}
-                            />
-                            <div className="flex gap-2 text-xs">
-                              <button
-                                onClick={() => saveNextActionEdit(na.id)}
-                                disabled={!editingNextActionText.trim()}
-                                className="text-white px-2 py-0.5 rounded disabled:opacity-40"
-                                style={{ backgroundColor: theme.accent }}
-                              >
-                                Save
-                              </button>
-                              <button
-                                onClick={() => setEditingNextActionId(null)}
-                                className="opacity-60 hover:opacity-100"
-                              >
-                                Cancel
-                              </button>
-                            </div>
-                          </div>
-                        ) : (
-                          <div>
-                            <div className="flex items-start justify-between gap-2">
-                              <p className="text-sm whitespace-pre-wrap flex-1">{na.text}</p>
-                              <div className="flex gap-2 shrink-0">
-                                <button
-                                  onClick={() => {
-                                    setEditingNextActionId(na.id);
-                                    setEditingNextActionText(na.text);
-                                  }}
-                                  className="text-xs text-gray-500 hover:opacity-100"
-                                >
-                                  Edit
-                                </button>
-                                <button
-                                  onClick={() => deleteNextAction(na.id)}
-                                  className="text-xs text-gray-400 hover:text-red-600"
-                                >
-                                  Delete
-                                </button>
-                              </div>
-                            </div>
-                            <p className="text-xs text-gray-400 mt-0.5">
-                              {new Date(na.createdAt).toLocaleString()}
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                </div>
-                {detailTask.nextActions.length > 5 && (
-                  <button
-                    onClick={() => setShowAllLogs((v) => !v)}
-                    className="text-xs mt-1.5 hover:underline"
-                    style={{ color: theme.accent }}
-                  >
-                    {showAllLogs ? 'Show fewer' : `Show ${detailTask.nextActions.length - 5} more`}
-                  </button>
-                )}
-
-                <div className="mt-4 pt-3 border-t border-gray-100">
-                  <label className="text-xs font-semibold text-gray-500">📝 Description</label>
-                  <textarea
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    rows={3}
-                    placeholder="Overall description of this task..."
-                    value={detailForm.description}
-                    onChange={(e) => setDetailForm({ ...detailForm, description: e.target.value })}
-                  />
-                </div>
-              </div>
-              )}
-
-              {!hiddenFields.has('coreFields') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4 grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">◎ Status</label>
-                  <select
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.statusId}
-                    onChange={(e) => setDetailForm({ ...detailForm, statusId: e.target.value })}
-                  >
-                    {[...detailSpace.statuses]
-                      .sort((a, b) => a.order - b.order)
-                      .map((s) => (
-                        <option key={s.id} value={s.id}>
-                          {s.name}
-                        </option>
-                      ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">🚩 Priority</label>
-                  <select
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.priority}
-                    onChange={(e) => setDetailForm({ ...detailForm, priority: e.target.value })}
-                  >
-                    <option value="">None</option>
-                    {PRIORITY_OPTIONS.map((p) => (
-                      <option key={p} value={p}>
-                        {p}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="col-span-2">
-                  <label className="text-xs font-semibold text-gray-500">🔗 Link (URL)</label>
-                  <input
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    placeholder="https://..."
-                    value={detailForm.url}
-                    onChange={(e) => setDetailForm({ ...detailForm, url: e.target.value })}
-                  />
-                </div>
-
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">👤 Assignee</label>
-                  <select
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={
-                      detailForm.assigneeId ||
-                      (detailForm.assigneeName ? `name:${detailForm.assigneeName}` : '')
-                    }
-                    onChange={(e) => {
-                      const value = e.target.value;
-                      const person = peopleForSpace(detailSpace.id).find(
-                        (p) => p.key === value || p.userId === value,
-                      );
-                      setDetailForm({
-                        ...detailForm,
-                        assigneeId: person?.userId || '',
-                        assigneeName: person?.name || '',
-                      });
-                    }}
-                  >
-                    <option value="">Unassigned</option>
-                    {peopleForSpace(detailSpace.id).map((p) => (
-                      <option key={p.key} value={p.key}>
-                        {p.email ? `${p.name} — ${p.email}` : p.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">🧑‍💼 Owner</label>
-                  <select
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.ownerName}
-                    onChange={(e) => setDetailForm({ ...detailForm, ownerName: e.target.value })}
-                  >
-                    <option value="">None</option>
-                    {detailForm.ownerName &&
-                      !peopleForSpace(detailSpace.id).some((p) => p.name === detailForm.ownerName) && (
-                        <option value={detailForm.ownerName}>{detailForm.ownerName}</option>
-                      )}
-                    {peopleForSpace(detailSpace.id).map((p) => (
-                      <option key={p.key} value={p.name}>
-                        {p.email ? `${p.name} — ${p.email}` : p.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">🏷️ Work Category</label>
-                  <input
-                    list="work-category-options"
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.workCategory}
-                    onChange={(e) => setDetailForm({ ...detailForm, workCategory: e.target.value })}
-                  />
-                  <datalist id="work-category-options">
-                    {WORK_CATEGORY_OPTIONS.map((o) => (
-                      <option key={o} value={o} />
-                    ))}
-                  </datalist>
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">📏 Scope</label>
-                  <input
-                    list="scope-options"
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.scope}
-                    onChange={(e) => setDetailForm({ ...detailForm, scope: e.target.value })}
-                  />
-                  <datalist id="scope-options">
-                    {SCOPE_OPTIONS.map((o) => (
-                      <option key={o} value={o} />
-                    ))}
-                  </datalist>
-                </div>
-              </div>
-              )}
-
-              {!hiddenFields.has('dates') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4 grid grid-cols-3 gap-3">
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">📅 Start Date</label>
-                  <input
-                    type="date"
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.startDate}
-                    onChange={(e) => setDetailForm({ ...detailForm, startDate: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">📅 Due Date</label>
-                  <input
-                    type="date"
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.dueDate}
-                    onChange={(e) => setDetailForm({ ...detailForm, dueDate: e.target.value })}
-                  />
-                </div>
-                <div>
-                  <label className="text-xs font-semibold text-gray-500">📅 Progress Date</label>
-                  <input
-                    type="date"
-                    className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                    value={detailForm.progressDate}
-                    onChange={(e) => setDetailForm({ ...detailForm, progressDate: e.target.value })}
-                  />
-                </div>
-              </div>
-              )}
-
-              {!hiddenFields.has('handoff') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
-                <label className="text-xs font-semibold text-gray-500">🔁 Hand off task to</label>
-                <div className="flex gap-2 mt-1">
-                  <input
-                    className="flex-1 border rounded-lg px-2 py-1.5 text-sm"
-                    placeholder="New owner's name"
-                    value={handOffTo}
-                    onChange={(e) => setHandOffTo(e.target.value)}
-                  />
-                  <button
-                    onClick={handOffTask}
-                    disabled={!handOffTo.trim()}
-                    className="bg-gray-700 text-white text-sm px-3 py-1.5 rounded-lg disabled:opacity-40"
-                  >
-                    Hand Off
-                  </button>
-                </div>
-                {detailForm.ownerName && (
-                  <p className="text-xs text-gray-500 mt-1">Current owner: {detailForm.ownerName}</p>
-                )}
-              </div>
-              )}
-
-              {/* Custom Fields */}
-              {!hiddenFields.has('customFields') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-semibold text-gray-500">🔧 Custom Fields</label>
-                  <button
-                    onClick={() => setAddingCustomField((v) => !v)}
-                    className="text-xs hover:underline"
-                    style={{ color: theme.accent }}
-                  >
-                    + Add Field
-                  </button>
-                </div>
-
-                {addingCustomField && (
-                  <form onSubmit={addCustomFieldDef} className="mt-2 space-y-2">
-                    <div className="flex gap-1">
-                      <input
-                        autoFocus
-                        className="flex-1 border rounded-lg px-2 py-1 text-sm"
-                        placeholder="Field name"
-                        value={newCustomFieldName}
-                        onChange={(e) => setNewCustomFieldName(e.target.value)}
-                      />
-                      <select
-                        className="border rounded-lg px-2 py-1 text-sm"
-                        value={newCustomFieldType}
-                        onChange={(e) => setNewCustomFieldType(e.target.value)}
-                      >
-                        {CUSTOM_FIELD_TYPES.map((t) => (
-                          <option key={t} value={t}>
-                            {t}
-                          </option>
+                <div className="flex flex-wrap items-center justify-end gap-1">
+                  <button type="button" onClick={() => openAiWorkspace({ newChat: true, context: { type: 'task', id: detailTask.id, name: detailTask.title, spaceId: detailSpace.id, listId: detailListId || undefined } })} className="rounded-lg px-2 py-1 text-xs text-gray-500 hover:bg-gray-100">Ask AI</button>
+                  <button type="button" onClick={() => { const pair = detailAsListTaskPair(); if (pair) duplicateTask(pair.list, pair.task, detailSpace); }} className="rounded-lg px-2 py-1 text-xs text-gray-500 hover:bg-gray-100">Duplicate</button>
+                  <button type="button" onClick={() => { const pair = detailAsListTaskPair(); if (pair) openMoveDialog(pair.list, pair.task); }} className="rounded-lg px-2 py-1 text-xs text-gray-500 hover:bg-gray-100">Move</button>
+                  <button type="button" onClick={() => { const pair = detailAsListTaskPair(); if (pair) openMergeDialog(pair.list, pair.task); }} className="rounded-lg px-2 py-1 text-xs text-gray-500 hover:bg-gray-100">Merge</button>
+                  <button type="button" onClick={openEmailComposer} className="rounded-lg px-2 py-1 text-xs text-gray-500 hover:bg-gray-100">Email</button>
+                  <button type="button" onClick={() => detailListId && deleteTaskFromList({ id: detailListId, name: '', spaceId: detailSpace.id }, detailTask, detailSpace)} className="rounded-lg px-2 py-1 text-xs text-gray-500 hover:bg-red-50 hover:text-red-600">Delete</button>
+                  <div className="relative">
+                    <button type="button" onClick={() => setCustomizeFieldsOpen((value) => !value)} className="rounded-lg px-2 py-1 text-xs text-gray-500 hover:bg-gray-100">Customize fields</button>
+                    {customizeFieldsOpen && (
+                      <div className="absolute right-0 top-8 z-30 w-72 rounded-xl border border-gray-200 bg-white p-3 text-left shadow-lg">
+                        <p className="mb-1 text-xs font-semibold text-gray-500">Show or hide sections</p>
+                        {FIELD_TOGGLES.map((item) => (
+                          <label key={item.key} className="flex items-center gap-2 py-0.5 text-xs text-gray-700">
+                            <input type="checkbox" checked={!hiddenFields.has(item.key)} onChange={() => toggleFieldVisibility(item.key)} />
+                            {item.label}
+                          </label>
                         ))}
-                      </select>
-                      <button className="text-white px-2 rounded-lg text-sm" style={{ backgroundColor: theme.accent }}>
-                        Add
-                      </button>
-                    </div>
-                    {newCustomFieldType === 'dropdown' && (
-                      <input
-                        className="w-full border rounded-lg px-2 py-1 text-sm"
-                        placeholder="Options, comma-separated (e.g. Low, Medium, High)"
-                        value={newCustomFieldOptions}
-                        onChange={(e) => setNewCustomFieldOptions(e.target.value)}
-                      />
-                    )}
-                  </form>
-                )}
-
-                <div className="mt-2 space-y-2">
-                  {detailTask.customFieldDefs.length === 0 && !addingCustomField && (
-                    <p className="text-xs text-gray-400">
-                      No custom fields yet for this space. Click "+ Add Field" to create one.
-                    </p>
-                  )}
-                  {detailTask.customFieldDefs
-                    .filter((def) => !hiddenCustomFieldIds.has(def.id))
-                    .map((def) => (
-                    <div key={def.id} className="group/field">
-                      <div className="flex items-center justify-between">
-                        <label className="text-xs font-semibold text-gray-500">{def.name}</label>
-                        <button
-                          onClick={() => toggleCustomFieldVisibility(def.id)}
-                          className="text-xs text-gray-300 hover:text-gray-600 opacity-0 group-hover/field:opacity-100"
-                          title={`Hide "${def.name}"`}
-                        >
-                          🙈 Hide
-                        </button>
-                      </div>
-                      {def.type === 'checkbox' ? (
-                        <input
-                          type="checkbox"
-                          className="block mt-1"
-                          checked={customFieldValues[def.id] === 'true'}
-                          onChange={(e) =>
-                            setCustomFieldValues({ ...customFieldValues, [def.id]: String(e.target.checked) })
-                          }
-                        />
-                      ) : def.type === 'date' ? (
-                        <input
-                          type="date"
-                          className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                          value={customFieldValues[def.id] || ''}
-                          onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })}
-                        />
-                      ) : def.type === 'number' ? (
-                        <input
-                          type="number"
-                          className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                          value={customFieldValues[def.id] || ''}
-                          onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })}
-                        />
-                      ) : def.type === 'dropdown' ? (
-                        <select
-                          className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                          value={customFieldValues[def.id] || ''}
-                          onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })}
-                        >
-                          <option value="">Select...</option>
-                          {((def.config?.options as string[]) || []).map((opt) => (
-                            <option key={opt} value={opt}>
-                              {opt}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <input
-                          className="w-full border rounded-lg px-2 py-1.5 mt-1 text-sm"
-                          value={customFieldValues[def.id] || ''}
-                          onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })}
-                        />
-                      )}
-                    </div>
-                  ))}
-                </div>
-
-                {detailTask.customFieldDefs.some((def) => hiddenCustomFieldIds.has(def.id)) && (
-                  <div className="relative mt-2">
-                    <button
-                      onClick={() => setManageHiddenCustomFieldsOpen((v) => !v)}
-                      className="text-xs hover:underline"
-                      style={{ color: theme.accent }}
-                    >
-                      {detailTask.customFieldDefs.filter((def) => hiddenCustomFieldIds.has(def.id)).length} field(s) hidden — Manage
-                    </button>
-                    {manageHiddenCustomFieldsOpen && (
-                      <div className="absolute left-0 z-20 mt-1 bg-white border rounded-lg shadow-xl p-2 w-56 space-y-1">
-                        {detailTask.customFieldDefs
-                          .filter((def) => hiddenCustomFieldIds.has(def.id))
-                          .map((def) => (
-                            <div key={def.id} className="flex items-center justify-between text-xs px-1 py-0.5">
-                              <span className="text-gray-600">{def.name}</span>
-                              <button
-                                onClick={() => toggleCustomFieldVisibility(def.id)}
-                                className="hover:underline"
-                                style={{ color: theme.accent }}
-                              >
-                                Show
-                              </button>
-                            </div>
-                          ))}
                       </div>
                     )}
                   </div>
-                )}
+                  <button type="button" onClick={saveTaskDetail} disabled={detailSaving} className="rounded-lg px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50" style={{ backgroundColor: theme.accent }}>{detailSaving ? 'Saving...' : 'Save'}</button>
+                </div>
               </div>
-              )}
+            </header>
 
-              {!hiddenFields.has('subtasks') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
-                <label className="text-xs font-semibold text-gray-500">🧩 Subtasks</label>
-                <div className="mt-1 space-y-1">
-                  {detailTask.subtasks.length === 0 && (
-                    <p className="text-xs text-gray-400">No subtasks yet.</p>
-                  )}
-                  {detailTask.subtasks.map((st) => (
-                    <div key={st.id} className="flex items-center justify-between bg-gray-50 rounded-lg px-2 py-1 text-sm">
-                      <span>{st.title}</span>
-                      <button onClick={() => deleteSubtask(st)} className="text-xs text-gray-400 hover:text-red-600">
-                        Del
-                      </button>
+            {emailSentNotice && <p className="mx-4 mt-3 rounded-lg border border-green-200 bg-green-50 px-3 py-2 text-sm text-green-700">{emailSentNotice}</p>}
+
+            <div className="mx-auto grid max-w-6xl grid-cols-1 gap-4 p-4 lg:grid-cols-[minmax(0,1.85fr)_minmax(240px,1fr)] lg:p-6">
+              <div className="min-w-0 space-y-4">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+                  {[
+                    ['Assignee', assignee?.name || detailForm.assigneeName],
+                    ['Reviewer', reviewer?.name || detailTask.reviewerName],
+                    ['Priority', detailForm.priority],
+                    ['Due', shortDate(detailForm.dueDate)],
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-xl border border-gray-200 bg-white px-3 py-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">{label}</p>
+                      <p className="mt-1 truncate text-sm text-gray-800">{value || '—'}</p>
                     </div>
                   ))}
-                </div>
-                <form onSubmit={addSubtask} className="flex gap-1 mt-2">
-                  <input
-                    className="flex-1 border rounded-lg px-2 py-1 text-sm"
-                    placeholder="New subtask"
-                    value={newSubtaskTitle}
-                    onChange={(e) => setNewSubtaskTitle(e.target.value)}
-                  />
-                  <button className="text-white px-2 rounded-lg text-sm" style={{ backgroundColor: theme.accent }}>
-                    Add
-                  </button>
-                </form>
-              </div>
-              )}
-
-              {/* Comments — including Approver quick-insert */}
-              {!hiddenFields.has('comments') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-semibold text-gray-500">💬 Comments</label>
-                  <button
-                    onClick={() => setAddingApprover((v) => !v)}
-                    className="text-xs hover:underline"
-                    style={{ color: theme.accent }}
-                  >
-                    + Insert Approver
-                  </button>
-                </div>
-
-                {addingApprover && (
-                  <div className="mt-2 space-y-2 bg-gray-50 rounded-lg p-2">
-                    <input
-                      autoFocus
-                      className="w-full border rounded-lg px-2 py-1 text-sm"
-                      placeholder="Approver's name"
-                      value={approverName}
-                      onChange={(e) => setApproverName(e.target.value)}
-                    />
-                    <div className="flex gap-1">
-                      <input
-                        type="datetime-local"
-                        className="flex-1 border rounded-lg px-2 py-1 text-sm"
-                        value={approverDateTime}
-                        onChange={(e) => setApproverDateTime(e.target.value)}
-                      />
-                      <button
-                        onClick={addApprover}
-                        disabled={!approverName.trim()}
-                        className="text-white text-sm px-3 py-1 rounded-lg disabled:opacity-40"
-                        style={{ backgroundColor: theme.accent }}
-                      >
-                        Insert
-                      </button>
+                  <div className="rounded-xl border border-gray-200 bg-white px-3 py-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-gray-400">Progress</p>
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-gray-100">
+                      <div className={`h-full rounded-full transition-all duration-500 ${tone.bar}`} style={{ width: `${progress}%` }} />
                     </div>
-                    <p className="text-xs text-gray-400">
-                      Leave the date/time blank to use the current date &amp; time.
-                    </p>
+                    <p className="mt-1 text-xs text-gray-500">{progress}%</p>
                   </div>
-                )}
-
-                <div className="mt-3 space-y-1.5 max-h-64 overflow-y-auto pr-1">
-                  {detailTask.comments.length === 0 && (
-                    <p className="text-xs text-gray-400">No comments yet.</p>
-                  )}
-                  {detailTask.comments.map((c) => (
-                    <div
-                      key={c.id}
-                      className={`rounded-lg px-2 py-1.5 group transition-colors ${ageBgClass(c.createdAt, nowTick)}`}
-                    >
-                      <div className="flex items-center justify-between">
-                        <p className="text-xs font-semibold text-gray-600">
-                          {c.authorName || user?.name || 'You'}
-                          {Date.now() - new Date(c.createdAt).getTime() < 2 * 60 * 60 * 1000 && (
-                            <span
-                              className="ml-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded-full text-white align-middle"
-                              style={{ backgroundColor: theme.accent }}
-                            >
-                              New
-                            </span>
-                          )}
-                        </p>
-                        <button
-                          onClick={() => deleteComment(c.id)}
-                          className="text-xs text-gray-300 hover:text-red-600 opacity-0 group-hover:opacity-100"
-                        >
-                          Del
-                        </button>
-                      </div>
-                      <p className="text-sm whitespace-pre-wrap">{c.body}</p>
-                      <p className="text-xs text-gray-400 mt-0.5">
-                        {new Date(c.createdAt).toLocaleString()}
-                      </p>
-                    </div>
-                  ))}
                 </div>
 
-                <div className="flex gap-2 mt-3">
-                  <div className="relative flex-1">
-                    {(() => {
-                      const mention = commentText.match(/(?:^|\s)@([^\s@]*)$/);
-                      const query = mention ? mention[1].toLowerCase() : null;
-                      const suggestions = query === null
-                        ? []
-                        : members.filter((m) => m.name.toLowerCase().includes(query)).slice(0, 6);
-                      if (!suggestions.length) return null;
-                      return (
-                        <div className="absolute bottom-full left-0 z-20 mb-1 w-full rounded-lg border border-gray-200 bg-white shadow-md overflow-hidden">
-                          {suggestions.map((m) => (
-                            <button
-                              key={m.userId}
-                              type="button"
-                              className="block w-full text-left px-2 py-1.5 text-sm hover:bg-gray-50"
-                              onMouseDown={(e) => {
-                                e.preventDefault();
-                                setCommentText((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (full) => `${full.startsWith('@') ? '' : full[0]}@${m.name} `));
-                              }}
-                            >
-                              @{m.name}
-                            </button>
-                          ))}
+                {!hiddenFields.has('description') && (
+                  <section className={card}>
+                    <h3 className="text-sm font-semibold text-gray-800">Description</h3>
+                    <textarea className={`${field} min-h-24 resize-y`} rows={4} placeholder="Overall description of this task..." value={detailForm.description} onChange={(e) => setDetailForm({ ...detailForm, description: e.target.value })} />
+                  </section>
+                )}
+
+                {!hiddenFields.has('description') && (
+                  <section className={card}>
+                    <h3 className="text-sm font-semibold text-gray-800">Daily Log</h3>
+                    <textarea className={`${field} resize-y`} rows={3} placeholder="What happened today on this task?" value={nextActionText} onChange={(e) => setNextActionText(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) addNextAction(); }} />
+                    <div className="mt-2 flex justify-end">
+                      <button type="button" onClick={addNextAction} disabled={!nextActionText.trim()} className="rounded-lg px-3 py-1.5 text-sm text-white disabled:opacity-40" style={{ backgroundColor: theme.accent }}>+ Add Log</button>
+                    </div>
+                    <div className="mt-4 space-y-4">
+                      {detailTask.nextActions.length === 0 && <p className="text-sm text-gray-400">No entries logged yet.</p>}
+                      {logs.map((group) => (
+                        <div key={group.key}>
+                          <p className="text-xs font-semibold text-gray-500">{group.label}</p>
+                          <div className="mt-2 space-y-2 border-l border-gray-200 pl-3">
+                            {group.items.map((entry) => (
+                              <div key={entry.id} className={`rounded-lg border px-3 py-2 ${dayColorClass(entry.createdAt, detailTask.nextActions.map((item) => item.createdAt))}`}>
+                                {editingNextActionId === entry.id ? (
+                                  <div className="space-y-2">
+                                    <textarea autoFocus className={field} rows={2} value={editingNextActionText} onChange={(e) => setEditingNextActionText(e.target.value)} />
+                                    <div className="flex gap-2 text-xs">
+                                      <button type="button" onClick={() => saveNextActionEdit(entry.id)} disabled={!editingNextActionText.trim()} className="rounded px-2 py-1 text-white disabled:opacity-40" style={{ backgroundColor: theme.accent }}>Save</button>
+                                      <button type="button" onClick={() => setEditingNextActionId(null)} className="text-gray-500">Cancel</button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <>
+                                    <div className="flex items-start justify-between gap-2">
+                                      <p className="whitespace-pre-wrap text-sm text-gray-800">{entry.text}</p>
+                                      <div className="flex shrink-0 gap-2 text-xs">
+                                        <button type="button" className="text-gray-500 hover:text-gray-800" onClick={() => { setEditingNextActionId(entry.id); setEditingNextActionText(entry.text); }}>Edit</button>
+                                        <button type="button" className="text-gray-400 hover:text-red-600" onClick={() => deleteNextAction(entry.id)}>Delete</button>
+                                      </div>
+                                    </div>
+                                    <p className="mt-1 text-[11px] text-gray-400">{new Date(entry.createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</p>
+                                  </>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         </div>
-                      );
-                    })()}
-                    <input
-                      className="w-full border rounded-lg px-2 py-1.5 text-sm"
-                      placeholder="Write a comment..."
-                      value={commentText}
-                      onChange={(e) => setCommentText(e.target.value)}
-                      onKeyDown={(e) => e.key === 'Enter' && addComment()}
-                    />
-                  </div>
-                  <button
-                    onClick={addComment}
-                    disabled={!commentText.trim()}
-                    className="text-white text-sm px-3 py-1.5 rounded-lg disabled:opacity-40"
-                    style={{ backgroundColor: theme.accent }}
-                  >
-                    Post
-                  </button>
-                </div>
-              </div>
-              )}
-
-              {!hiddenFields.has('attachments') && (
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-semibold text-gray-500">📎 Attachments</label>
-                  <label
-                    className="text-xs hover:underline cursor-pointer"
-                    style={{ color: theme.accent, opacity: uploadingAttachment ? 0.5 : 1 }}
-                  >
-                    {uploadingAttachment ? 'Uploading...' : '+ Upload'}
-                    <input
-                      type="file"
-                      multiple
-                      className="hidden"
-                      disabled={uploadingAttachment}
-                      onChange={(e) => {
-                        uploadAttachment(e.target.files);
-                        e.target.value = '';
-                      }}
-                    />
-                  </label>
-                </div>
-                <div className="mt-2 space-y-1.5">
-                  {detailTask.attachments.length === 0 && (
-                    <p className="text-xs text-gray-400">No files attached yet — click "+ Upload" to add one.</p>
-                  )}
-                  {detailTask.attachments.map((a) => {
-                    const isImage = /\.(png|jpe?g|gif|webp|svg)$/i.test(a.name);
-                    const fullUrl = `${API_URL}${a.url}`;
-                    return (
-                      <div key={a.id} className="flex items-center gap-2 bg-gray-50 rounded-lg px-2 py-1.5">
-                        {isImage ? (
-                          <a href={fullUrl} target="_blank" rel="noreferrer" className="shrink-0">
-                            <img src={fullUrl} alt={a.name} className="w-10 h-10 object-cover rounded border" />
-                          </a>
-                        ) : (
-                          <span className="text-lg shrink-0">📄</span>
-                        )}
-                        <a
-                          href={fullUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-sm flex-1 truncate hover:underline"
-                          style={{ color: theme.accent }}
-                          title={a.name}
-                        >
-                          {a.name}
-                        </a>
-                        <button
-                          onClick={() => deleteAttachment(a.id)}
-                          className="text-xs text-gray-400 hover:text-red-600 shrink-0"
-                        >
-                          Del
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-                <p className="text-xs text-gray-400 mt-2">
-                  Selected files can be included when you email this task from the header.
-                </p>
-              </div>
-              )}
-
-              <div className="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
-                <h3 className="text-xs font-semibold text-gray-500 mb-2">Activity</h3>
-                {(detailTask.activityLogs || []).length === 0 && (
-                  <p className="text-xs text-gray-400">No email activity yet.</p>
+                      ))}
+                    </div>
+                    {detailTask.nextActions.length > 5 && (
+                      <button type="button" onClick={() => setShowAllLogs((value) => !value)} className="mt-2 text-xs hover:underline" style={{ color: theme.accent }}>{showAllLogs ? 'Show fewer' : `Show ${detailTask.nextActions.length - 5} more`}</button>
+                    )}
+                  </section>
                 )}
-                <div className="space-y-1.5">
-                  {(detailTask.activityLogs || []).map((entry) => (
-                    <p key={entry.id} className="text-sm text-gray-700">
-                      {entry.action}
-                      <span className="block text-[11px] text-gray-400">
-                        {new Date(entry.createdAt).toLocaleString()}
-                      </span>
-                    </p>
-                  ))}
-                </div>
-              </div>
-            </div>
 
-            <div className="flex gap-2 py-6">
-              <button
-                onClick={saveTaskDetail}
-                disabled={detailSaving}
-                className="text-white px-4 py-2 rounded-lg text-sm font-medium disabled:opacity-50"
-                style={{ backgroundColor: theme.accent }}
-              >
-                {detailSaving ? 'Saving...' : 'Save'}
-              </button>
-              <button onClick={closeTaskDetail} className="text-gray-500 px-4 py-2 text-sm">
-                Cancel
-              </button>
+                {!hiddenFields.has('dates') && (
+                  <section className={card}>
+                    <h3 className="text-sm font-semibold text-gray-800">Planning</h3>
+                    <div className="mt-3 grid grid-cols-2 gap-3">
+                      <label className="text-xs text-gray-500">Start date<input type="date" className={field} value={detailForm.startDate} onChange={(e) => setDetailForm({ ...detailForm, startDate: e.target.value })} /></label>
+                      <label className="text-xs text-gray-500">Due date<input type="date" className={field} value={detailForm.dueDate} onChange={(e) => setDetailForm({ ...detailForm, dueDate: e.target.value })} /></label>
+                      <label className="text-xs text-gray-500">Estimated time<select className={field} value={detailForm.estimatedTime} onChange={(e) => setDetailForm({ ...detailForm, estimatedTime: e.target.value })}><option value="">None</option>{DURATION_OPTIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
+                      <label className="text-xs text-gray-500">Actual time<select className={field} value={detailForm.actualTime} onChange={(e) => setDetailForm({ ...detailForm, actualTime: e.target.value })}><option value="">None</option>{DURATION_OPTIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
+                      <label className="col-span-2 text-xs text-gray-500">Progress date<input type="date" className={field} value={detailForm.progressDate} onChange={(e) => setDetailForm({ ...detailForm, progressDate: e.target.value })} /></label>
+                    </div>
+                    <p className="mt-3 text-xs text-gray-500">Estimated {detailForm.estimatedTime || '—'} vs actual {detailForm.actualTime || '—'}</p>
+                    <div className="mt-2 flex items-center gap-2">
+                      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-gray-100"><div className={`h-full rounded-full transition-all duration-500 ${tone.bar}`} style={{ width: `${progress}%` }} /></div>
+                      <span className="text-xs text-gray-500">{progress}%</span>
+                    </div>
+                  </section>
+                )}
+
+                {!hiddenFields.has('coreFields') && (
+                  <section className={card}>
+                    <div className="flex items-center justify-between gap-2">
+                      <h3 className="text-sm font-semibold text-gray-800">Ownership</h3>
+                      <input className="w-40 rounded-lg border border-gray-200 px-2 py-1 text-xs" placeholder="Search people" value={peopleQuery} onChange={(e) => setPeopleQuery(e.target.value)} />
+                    </div>
+                    <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <label className="text-xs text-gray-500">Assignee
+                        <span className="mt-1 flex items-center gap-2">
+                          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gray-100 text-[10px] text-gray-600">{personInitials(assignee?.name || detailForm.assigneeName)}</span>
+                          <select className="w-full rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-sm" value={detailForm.assigneeId || (detailForm.assigneeName ? `name:${detailForm.assigneeName}` : '')} onChange={(e) => { const person = peopleForSpace(detailSpace.id).find((item) => item.key === e.target.value || item.userId === e.target.value); setDetailForm({ ...detailForm, assigneeId: person?.userId || '', assigneeName: person?.name || '' }); }}>
+                            <option value="">Unassigned</option>
+                            {matchingPeople.map((person) => <option key={person.key} value={person.key}>{person.email ? `${person.name} — ${person.email}` : person.name}</option>)}
+                          </select>
+                        </span>
+                      </label>
+                      <label className="text-xs text-gray-500">Owner
+                        <span className="mt-1 flex items-center gap-2">
+                          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gray-100 text-[10px] text-gray-600">{personInitials(detailForm.ownerName)}</span>
+                          <select className="w-full rounded-lg border border-gray-200 bg-white px-2.5 py-1.5 text-sm" value={detailForm.ownerName} onChange={(e) => setDetailForm({ ...detailForm, ownerName: e.target.value })}>
+                            <option value="">None</option>
+                            {detailForm.ownerName && !matchingPeople.some((person) => person.name === detailForm.ownerName) && <option value={detailForm.ownerName}>{detailForm.ownerName}</option>}
+                            {matchingPeople.map((person) => <option key={person.key} value={person.name}>{person.email ? `${person.name} — ${person.email}` : person.name}</option>)}
+                          </select>
+                        </span>
+                      </label>
+                      <label className="text-xs text-gray-500">Reviewer
+                        <input className={field} placeholder="Search a member" value={reviewerFilter} onChange={(e) => setReviewerFilter(e.target.value)} />
+                        <select className={field} value={detailForm.reviewerId} onChange={(e) => setDetailForm({ ...detailForm, reviewerId: e.target.value })}>
+                          <option value="">No reviewer</option>
+                          {detailForm.reviewerId && !people.some((person) => person.userId === detailForm.reviewerId) && <option value={detailForm.reviewerId}>{detailTask.reviewerName || 'Reviewer'}</option>}
+                          {people.filter((person) => { const query = reviewerFilter.trim().toLowerCase(); return !query || person.userId === detailForm.reviewerId || `${person.name} ${person.email || ''}`.toLowerCase().includes(query); }).map((person) => <option key={person.key} value={person.userId || ''}>{person.email ? `${person.name} — ${person.email}` : person.name}</option>)}
+                        </select>
+                      </label>
+                      <label className="text-xs text-gray-500">Team / department
+                        <select className={field} value={detailForm.team} onChange={(e) => setDetailForm({ ...detailForm, team: e.target.value })}>
+                          <option value="">None</option>
+                          {TEAM_OPTIONS.map((option) => <option key={option}>{option}</option>)}
+                        </select>
+                      </label>
+                    </div>
+                  </section>
+                )}
+
+                {!hiddenFields.has('coreFields') && (
+                  <section className={card}>
+                    <h3 className="text-sm font-semibold text-gray-800">Classification</h3>
+                    <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      <label className="text-xs text-gray-500">Task type<select className={field} value={detailForm.taskType} onChange={(e) => setDetailForm({ ...detailForm, taskType: e.target.value })}><option value="">None</option>{TASK_TYPE_OPTIONS.map((option) => <option key={option}>{option}</option>)}</select></label>
+                      <label className="text-xs text-gray-500">Work category<input list="work-category-options" className={field} value={detailForm.workCategory} onChange={(e) => setDetailForm({ ...detailForm, workCategory: e.target.value })} /><datalist id="work-category-options">{WORK_CATEGORY_OPTIONS.map((option) => <option key={option} value={option} />)}</datalist></label>
+                      <label className="text-xs text-gray-500">Scope<input list="scope-options" className={field} value={detailForm.scope} onChange={(e) => setDetailForm({ ...detailForm, scope: e.target.value })} /><datalist id="scope-options">{SCOPE_OPTIONS.map((option) => <option key={option} value={option} />)}</datalist></label>
+                      <label className="text-xs text-gray-500">Link<input className={field} placeholder="https://..." value={detailForm.url} onChange={(e) => setDetailForm({ ...detailForm, url: e.target.value })} /></label>
+                    </div>
+                  </section>
+                )}
+
+                <section className={card}>
+                  <h3 className="text-sm font-semibold text-gray-800">Acceptance criteria</h3>
+                  {criteria.length === 0 && <p className="mt-2 text-sm text-gray-400">No criteria yet. Add what must be finished before this task is done.</p>}
+                  <div className="mt-2 space-y-1.5">
+                    {detailForm.acceptanceCriteria.split('\n').map((line, index) => criterionBody(line).trim() ? (
+                      <label key={`${index}-${line}`} className="flex items-start gap-2 rounded-lg px-1 py-1 text-sm text-gray-800 hover:bg-gray-50">
+                        <input type="checkbox" className="mt-1" checked={criterionChecked(line)} onChange={() => setDetailForm({ ...detailForm, acceptanceCriteria: toggleCriterion(detailForm.acceptanceCriteria, index) })} />
+                        <span className={criterionChecked(line) ? 'text-gray-400 line-through' : ''}>{criterionBody(line)}</span>
+                      </label>
+                    ) : null)}
+                  </div>
+                  <div className="mt-2 flex gap-2">
+                    <input className="flex-1 rounded-lg border border-gray-200 px-2.5 py-1.5 text-sm" placeholder="Add a criterion" value={criterionDraft} onChange={(e) => setCriterionDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && criterionDraft.trim()) { e.preventDefault(); const next = detailForm.acceptanceCriteria.trim() ? `${detailForm.acceptanceCriteria.replace(/\s+$/, '')}\n${criterionDraft.trim()}` : criterionDraft.trim(); setDetailForm({ ...detailForm, acceptanceCriteria: next }); setCriterionDraft(''); } }} />
+                    <button type="button" className="rounded-lg px-3 py-1.5 text-sm text-white" style={{ backgroundColor: theme.accent }} onClick={() => { if (!criterionDraft.trim()) return; const next = detailForm.acceptanceCriteria.trim() ? `${detailForm.acceptanceCriteria.replace(/\s+$/, '')}\n${criterionDraft.trim()}` : criterionDraft.trim(); setDetailForm({ ...detailForm, acceptanceCriteria: next }); setCriterionDraft(''); }}>Add</button>
+                  </div>
+                </section>
+
+                <section id="task-dependencies" className={card}>
+                  <h3 className="text-sm font-semibold text-gray-800">Dependencies</h3>
+                  <div className="mt-3 grid gap-2 text-sm">
+                    {['Blocked by', 'Blocks', 'Related to'].map((kind) => (
+                      <div key={kind}>
+                        <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">{kind}</p>
+                        {detailForm.dependencyLabel && (detailForm.dependencyType || 'Related to') === kind ? (
+                          <div className="mt-1 flex items-center justify-between rounded-lg border border-gray-200 px-3 py-2">
+                            <span className="truncate text-gray-800">{detailForm.dependencyLabel}</span>
+                            <button type="button" className="text-xs text-gray-400 hover:text-red-600" onClick={() => setDetailForm({ ...detailForm, dependencyTaskId: '', dependencyType: '', dependencyLabel: '' })}>Remove</button>
+                          </div>
+                        ) : <p className="mt-1 text-xs text-gray-400">None</p>}
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <select className={field} value={detailForm.dependencyType} onChange={(e) => setDetailForm({ ...detailForm, dependencyType: e.target.value })}>
+                      <option value="">Type</option>
+                      {DEPENDENCY_OPTIONS.map((option) => <option key={option}>{option}</option>)}
+                    </select>
+                    <input className={field} placeholder="Search a task" value={dependencyQuery} onChange={(e) => {
+                      const value = e.target.value;
+                      setDependencyQuery(value);
+                      if (!selectedWorkspace || value.trim().length < 1) { setDependencyHits([]); return; }
+                      apiFetch(`/workspaces/${selectedWorkspace.id}/search?q=${encodeURIComponent(value.trim())}`).then((result: { tasks?: { id: string; title: string; code?: string | null }[] }) => setDependencyHits((result.tasks || []).filter((item) => item.id !== detailTask.id).slice(0, 8))).catch(() => setDependencyHits([]));
+                    }} />
+                  </div>
+                  {dependencyHits.length > 0 && (
+                    <div className="mt-1 overflow-hidden rounded-lg border border-gray-200">
+                      {dependencyHits.map((hit) => (
+                        <button key={hit.id} type="button" className="block w-full px-3 py-2 text-left text-sm hover:bg-gray-50" onClick={() => { setDetailForm({ ...detailForm, dependencyTaskId: hit.id, dependencyType: detailForm.dependencyType || 'Related to', dependencyLabel: `${hit.code ? `${hit.code} · ` : ''}${hit.title}` }); setDependencyQuery(''); setDependencyHits([]); }}>
+                          {hit.code ? `${hit.code} · ` : ''}{hit.title}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <p className="mt-2 text-xs text-gray-400">Space: {detailSpace.name}</p>
+                </section>
+
+                {!hiddenFields.has('subtasks') && (
+                  <section id="task-subtasks" className={card}>
+                    <h3 className="text-sm font-semibold text-gray-800">Subtasks</h3>
+                    <div className="mt-2 space-y-1">
+                      {detailTask.subtasks.length === 0 && <p className="text-sm text-gray-400">No subtasks yet.</p>}
+                      {detailTask.subtasks.map((subtask) => (
+                        <div key={subtask.id} className="flex items-center justify-between rounded-lg bg-gray-50 px-3 py-1.5 text-sm">
+                          <span>{subtask.title}</span>
+                          <button type="button" onClick={() => deleteSubtask(subtask)} className="text-xs text-gray-400 hover:text-red-600">Delete</button>
+                        </div>
+                      ))}
+                    </div>
+                    <form onSubmit={addSubtask} className="mt-2 flex gap-2">
+                      <input className="flex-1 rounded-lg border border-gray-200 px-2.5 py-1.5 text-sm" placeholder="New subtask" value={newSubtaskTitle} onChange={(e) => setNewSubtaskTitle(e.target.value)} />
+                      <button className="rounded-lg px-3 text-sm text-white" style={{ backgroundColor: theme.accent }}>Add</button>
+                    </form>
+                  </section>
+                )}
+
+                {!hiddenFields.has('attachments') && (
+                  <section
+                    id="task-attachments"
+                    className={card}
+                    onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('ring-2', 'ring-blue-200'); }}
+                    onDragLeave={(e) => e.currentTarget.classList.remove('ring-2', 'ring-blue-200')}
+                    onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove('ring-2', 'ring-blue-200'); uploadAttachment(e.dataTransfer.files); }}
+                  >
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-semibold text-gray-800">Attachments</h3>
+                      <button type="button" className="text-xs hover:underline" style={{ color: theme.accent }} onClick={() => taskFileInput.current?.click()}>{uploadingAttachment ? 'Uploading...' : '+ Upload files'}</button>
+                      <input ref={taskFileInput} type="file" multiple className="hidden" disabled={uploadingAttachment} onChange={(e) => { uploadAttachment(e.target.files); e.target.value = ''; }} />
+                    </div>
+                    <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      {detailTask.attachments.length === 0 && <p className="text-sm text-gray-400 sm:col-span-2">No files attached yet. Drop files here or upload.</p>}
+                      {detailTask.attachments.map((file) => {
+                        const image = /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name);
+                        const fullUrl = `${API_URL}${file.url}`;
+                        return (
+                          <div key={file.id} className="flex items-center gap-2 rounded-xl border border-gray-200 px-3 py-2">
+                            {image ? <img src={fullUrl} alt="" className="h-10 w-10 rounded object-cover" /> : <span className="text-lg">📄</span>}
+                            <a href={fullUrl} target="_blank" rel="noreferrer" className="min-w-0 flex-1 truncate text-sm hover:underline" style={{ color: theme.accent }}>{file.name}</a>
+                            <button type="button" onClick={() => deleteAttachment(file.id)} className="text-xs text-gray-400 hover:text-red-600">Delete</button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p className="mt-2 text-xs text-gray-400">Selected files can be included when you email this task from the header.</p>
+                  </section>
+                )}
+
+                {!hiddenFields.has('comments') && (
+                  <section id="task-comments" className={card}>
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-semibold text-gray-800">Comments</h3>
+                      <button type="button" onClick={() => setAddingApprover((value) => !value)} className="text-xs hover:underline" style={{ color: theme.accent }}>+ Insert approver</button>
+                    </div>
+                    {addingApprover && (
+                      <div className="mt-2 space-y-2 rounded-lg bg-gray-50 p-2">
+                        <input className={field} placeholder="Approver's name" value={approverName} onChange={(e) => setApproverName(e.target.value)} />
+                        <div className="flex gap-2">
+                          <input type="datetime-local" className="flex-1 rounded-lg border border-gray-200 px-2 py-1.5 text-sm" value={approverDateTime} onChange={(e) => setApproverDateTime(e.target.value)} />
+                          <button type="button" onClick={addApprover} disabled={!approverName.trim()} className="rounded-lg px-3 text-sm text-white disabled:opacity-40" style={{ backgroundColor: theme.accent }}>Insert</button>
+                        </div>
+                        <p className="text-xs text-gray-400">Leave the date and time blank to use the current date and time.</p>
+                      </div>
+                    )}
+                    <div className="mt-3 space-y-2">
+                      {detailTask.comments.length === 0 && <p className="text-sm text-gray-400">No comments yet.</p>}
+                      {detailTask.comments.map((comment) => (
+                        <div key={comment.id} className={`rounded-xl px-3 py-2 ${ageBgClass(comment.createdAt, nowTick)}`}>
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="flex items-center gap-2 text-sm font-medium text-gray-800">
+                              <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-white text-[10px] text-gray-500">{personInitials(comment.authorName || user?.name)}</span>
+                              {comment.authorName || user?.name || 'You'}
+                              {nowTick - new Date(comment.createdAt).getTime() < 2 * 60 * 60 * 1000 && <span className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold text-white" style={{ backgroundColor: theme.accent }}>New</span>}
+                            </p>
+                            <button type="button" onClick={() => deleteComment(comment.id)} className="text-xs text-gray-400 hover:text-red-600">Delete</button>
+                          </div>
+                          <p className="mt-1 whitespace-pre-wrap text-sm text-gray-700">{comment.body}</p>
+                          <p className="mt-1 text-[11px] text-gray-400">{new Date(comment.createdAt).toLocaleString()}</p>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="relative mt-3 flex gap-2">
+                      {(() => {
+                        const mention = commentText.match(/(?:^|\s)@([^\s@]*)$/);
+                        const query = mention ? mention[1].toLowerCase() : null;
+                        const suggestions = query === null ? [] : members.filter((member) => member.name.toLowerCase().includes(query)).slice(0, 6);
+                        if (!suggestions.length) return null;
+                        return (
+                          <div className="absolute bottom-full left-0 z-20 mb-1 w-full overflow-hidden rounded-lg border border-gray-200 bg-white shadow-md">
+                            {suggestions.map((member) => (
+                              <button key={member.userId} type="button" className="block w-full px-2 py-1.5 text-left text-sm hover:bg-gray-50" onMouseDown={(e) => { e.preventDefault(); setCommentText((prev) => prev.replace(/(?:^|\s)@([^\s@]*)$/, (full) => `${full.startsWith('@') ? '' : full[0]}@${member.name} `)); }}>@{member.name}</button>
+                            ))}
+                          </div>
+                        );
+                      })()}
+                      <input className="flex-1 rounded-lg border border-gray-200 px-2.5 py-1.5 text-sm" placeholder="Write a comment..." value={commentText} onChange={(e) => setCommentText(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && addComment()} />
+                      <button type="button" onClick={addComment} disabled={!commentText.trim()} className="rounded-lg px-3 text-sm text-white disabled:opacity-40" style={{ backgroundColor: theme.accent }}>Post</button>
+                    </div>
+                  </section>
+                )}
+
+                {!hiddenFields.has('customFields') && (
+                  <section className={card}>
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-semibold text-gray-800">Custom fields</h3>
+                      <button type="button" onClick={() => setAddingCustomField((value) => !value)} className="text-xs hover:underline" style={{ color: theme.accent }}>+ Add field</button>
+                    </div>
+                    {addingCustomField && (
+                      <form onSubmit={addCustomFieldDef} className="mt-2 space-y-2">
+                        <div className="flex gap-2">
+                          <input className="flex-1 rounded-lg border border-gray-200 px-2 py-1 text-sm" placeholder="Field name" value={newCustomFieldName} onChange={(e) => setNewCustomFieldName(e.target.value)} />
+                          <select className="rounded-lg border border-gray-200 px-2 py-1 text-sm" value={newCustomFieldType} onChange={(e) => setNewCustomFieldType(e.target.value)}>{CUSTOM_FIELD_TYPES.map((type) => <option key={type}>{type}</option>)}</select>
+                          <button className="rounded-lg px-2 text-sm text-white" style={{ backgroundColor: theme.accent }}>Add</button>
+                        </div>
+                        {newCustomFieldType === 'dropdown' && <input className="w-full rounded-lg border border-gray-200 px-2 py-1 text-sm" placeholder="Options, comma-separated" value={newCustomFieldOptions} onChange={(e) => setNewCustomFieldOptions(e.target.value)} />}
+                      </form>
+                    )}
+                    <div className="mt-3 space-y-2">
+                      {detailTask.customFieldDefs.filter((def) => !hiddenCustomFieldIds.has(def.id)).length === 0 && <p className="text-sm text-gray-400">No custom fields are shown. Use Customize fields or add one.</p>}
+                      {detailTask.customFieldDefs.filter((def) => !hiddenCustomFieldIds.has(def.id)).map((def) => (
+                        <div key={def.id}>
+                          <div className="flex items-center justify-between">
+                            <label className="text-xs text-gray-500">{def.name}</label>
+                            <button type="button" onClick={() => toggleCustomFieldVisibility(def.id)} className="text-xs text-gray-400">Hide</button>
+                          </div>
+                          {def.type === 'checkbox' ? <input type="checkbox" className="mt-1" checked={customFieldValues[def.id] === 'true'} onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: String(e.target.checked) })} />
+                            : def.type === 'date' ? <input type="date" className={field} value={customFieldValues[def.id] || ''} onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })} />
+                            : def.type === 'number' ? <input type="number" className={field} value={customFieldValues[def.id] || ''} onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })} />
+                            : def.type === 'dropdown' ? <select className={field} value={customFieldValues[def.id] || ''} onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })}><option value="">Select...</option>{((def.config?.options as string[]) || []).map((option) => <option key={option}>{option}</option>)}</select>
+                            : <input className={field} value={customFieldValues[def.id] || ''} onChange={(e) => setCustomFieldValues({ ...customFieldValues, [def.id]: e.target.value })} />}
+                        </div>
+                      ))}
+                    </div>
+                    {detailTask.customFieldDefs.some((def) => hiddenCustomFieldIds.has(def.id)) && (
+                      <div className="relative mt-3">
+                        <button type="button" onClick={() => setManageHiddenCustomFieldsOpen((value) => !value)} className="text-xs hover:underline" style={{ color: theme.accent }}>
+                          {detailTask.customFieldDefs.filter((def) => hiddenCustomFieldIds.has(def.id)).length} field(s) hidden — Manage
+                        </button>
+                        {manageHiddenCustomFieldsOpen && (
+                          <div className="absolute left-0 z-20 mt-1 w-56 space-y-1 rounded-lg border border-gray-200 bg-white p-2 shadow-lg">
+                            {detailTask.customFieldDefs.filter((def) => hiddenCustomFieldIds.has(def.id)).map((def) => (
+                              <div key={def.id} className="flex items-center justify-between px-1 py-0.5 text-xs">
+                                <span className="text-gray-600">{def.name}</span>
+                                <button type="button" onClick={() => toggleCustomFieldVisibility(def.id)} className="hover:underline" style={{ color: theme.accent }}>Show</button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                )}
+
+                {!hiddenFields.has('handoff') && (
+                  <section className={card}>
+                    <h3 className="text-sm font-semibold text-gray-800">Hand off</h3>
+                    <div className="mt-2 flex gap-2">
+                      <input className="flex-1 rounded-lg border border-gray-200 px-2.5 py-1.5 text-sm" placeholder="New owner's name" value={handOffTo} onChange={(e) => setHandOffTo(e.target.value)} />
+                      <button type="button" onClick={handOffTask} disabled={!handOffTo.trim()} className="rounded-lg bg-gray-800 px-3 text-sm text-white disabled:opacity-40">Hand off</button>
+                    </div>
+                    {detailForm.ownerName && <p className="mt-1 text-xs text-gray-500">Current owner: {detailForm.ownerName}</p>}
+                  </section>
+                )}
+
+                <section className={card}>
+                  <h3 className="text-sm font-semibold text-gray-800">Activity</h3>
+                  {(detailTask.activityLogs || []).length === 0 && <p className="mt-2 text-sm text-gray-400">No email activity yet.</p>}
+                  <div className="mt-2 space-y-2">
+                    {(detailTask.activityLogs || []).map((entry) => (
+                      <p key={entry.id} className="text-sm text-gray-700">{entry.action}<span className="block text-[11px] text-gray-400">{new Date(entry.createdAt).toLocaleString()}</span></p>
+                    ))}
+                  </div>
+                </section>
+              </div>
+
+              <aside className="h-fit space-y-4 lg:sticky lg:top-24">
+                <details open className={card}>
+                  <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-gray-400">Task summary</summary>
+                  <label className="mt-3 block text-xs text-gray-500">Status
+                    <select className={field} value={detailForm.statusId} onChange={(e) => setDetailForm({ ...detailForm, statusId: e.target.value })}>
+                      {[...detailSpace.statuses].sort((a, b) => a.order - b.order).map((status) => <option key={status.id} value={status.id}>{status.name}</option>)}
+                    </select>
+                  </label>
+                  <label className="mt-2 block text-xs text-gray-500">Priority
+                    <select className={field} value={detailForm.priority} onChange={(e) => setDetailForm({ ...detailForm, priority: e.target.value })}>
+                      <option value="">None</option>
+                      {PRIORITY_OPTIONS.map((option) => <option key={option}>{option}</option>)}
+                    </select>
+                  </label>
+                  <label className="mt-2 block text-xs text-gray-500">Approval
+                    <select className={field} value={detailForm.approvalStatus} onChange={(e) => setDetailForm({ ...detailForm, approvalStatus: e.target.value })}>
+                      {APPROVAL_OPTIONS.map((option) => <option key={option}>{option}</option>)}
+                    </select>
+                  </label>
+                  <div className="mt-3 space-y-2 text-sm text-gray-700">
+                    <p className="flex items-center gap-2"><span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gray-100 text-[10px]">{personInitials(assignee?.name || detailForm.assigneeName)}</span>{assignee?.name || detailForm.assigneeName || 'Unassigned'}</p>
+                    <p className="flex items-center gap-2"><span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gray-100 text-[10px]">{personInitials(reviewer?.name || detailTask.reviewerName)}</span>{reviewer?.name || detailTask.reviewerName || 'No reviewer'}</p>
+                    <p className="text-xs text-gray-500">Due {shortDate(detailForm.dueDate)}</p>
+                  </div>
+                  <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-gray-100"><div className={`h-full rounded-full transition-all duration-500 ${tone.bar}`} style={{ width: `${progress}%` }} /></div>
+                  <p className="mt-1 text-xs text-gray-500">{progress}% based on status</p>
+                </details>
+                <details open className={card}>
+                  <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-gray-400">Quick actions</summary>
+                  <div className="mt-2 grid grid-cols-1 gap-1">
+                    <button type="button" className="rounded-lg px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-50" onClick={() => document.getElementById('task-subtasks')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>+ Add subtask</button>
+                    <button type="button" className="rounded-lg px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-50" onClick={() => taskFileInput.current?.click()}>Attach file</button>
+                    <button type="button" className="rounded-lg px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-50" onClick={() => document.getElementById('task-comments')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>Add comment</button>
+                    <button type="button" className="rounded-lg px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-50" onClick={openEmailComposer}>Send update</button>
+                    <button type="button" className="rounded-lg px-2 py-1.5 text-left text-sm text-gray-700 hover:bg-gray-50" onClick={() => openAiWorkspace({ newChat: true, context: { type: 'task', id: detailTask.id, name: detailTask.title, spaceId: detailSpace.id, listId: detailListId || undefined } })}>Ask AI</button>
+                  </div>
+                </details>
+                <details open className={card}>
+                  <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-gray-400">Relationships</summary>
+                  <p className="mt-2 text-sm text-gray-700">Parent · {parentTask ? `${parentTask.code ? `${parentTask.code} · ` : ''}${parentTask.title}` : detailTask.parentTaskId ? 'Linked parent' : 'None'}</p>
+                  <p className="mt-1 text-sm text-gray-700">Space · {detailSpace.name}</p>
+                  <p className="mt-1 text-sm text-gray-700">{detailForm.dependencyLabel ? `${detailForm.dependencyType || 'Related to'} · ${detailForm.dependencyLabel}` : 'No dependency'}</p>
+                  <button type="button" className="mt-2 text-xs hover:underline" style={{ color: theme.accent }} onClick={() => document.getElementById('task-dependencies')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>Edit dependency</button>
+                </details>
+              </aside>
             </div>
           </div>
-        )}
+          );
+        })()}
           </>
         )}
         </div>
