@@ -1,6 +1,6 @@
 {
-  "name": "ClickUp Clone",
-  "short_name": "ClickUp",
+  "name": "Bellora",
+  "short_name": "Bellora",
   "description": "Task and project management, built for your team.",
   "start_url": "/",
   "display": "standalone",

@@ -2325,7 +2325,7 @@ export default function Home({ initialView }: { initialView?: 'notifications' | 
       <main style={themeStyle} className="min-h-screen flex items-center justify-center bg-[var(--main-bg)]">
         <div className="w-full max-w-sm bg-white p-8 rounded-2xl shadow-xl border border-black/5">
           <h1 className="text-2xl font-bold mb-6 text-center" style={{ color: theme.accent }}>
-            ClickUp Clone
+            Bellora
           </h1>
           <div className="flex mb-4 border rounded-xl overflow-hidden">
             <button

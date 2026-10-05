@@ -13,13 +13,13 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ClickUp Clone",
+  title: "Bellora",
   description: "Task and project management, built for your team.",
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
-    title: "ClickUp Clone",
+    title: "Bellora",
   },
 };
 
